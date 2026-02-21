@@ -29,6 +29,7 @@ npm install blazingmq-node
   - [Producer](#producer)
   - [Consumer](#consumer)
   - [Admin](#admin)
+  - [BrokerAdmin (Broker Management)](#brokeradmin-broker-management)
   - [Session (Low-Level)](#session-low-level)
 - [Configuration](#configuration)
 - [Error Handling](#error-handling)
@@ -330,6 +331,81 @@ const admin = new Admin(options?: AdminOptions);
 | `getQueueInfo()` | `QueueInfo[]` | Get all managed queue info |
 | `pingBroker()` | `boolean` | Check connection health |
 
+### BrokerAdmin (Broker Management)
+
+The `BrokerAdmin` class connects to the broker's admin port for monitoring
+and management operations not available through the standard client protocol.
+
+```typescript
+import { BrokerAdmin } from 'blazingmq-node';
+
+const admin = new BrokerAdmin({
+  host: 'localhost',
+  port: 30114,
+  timeout: 10000,
+});
+
+// Check connectivity
+const isUp = await admin.ping();
+
+// Cluster health
+const clusters = await admin.listClusters();
+const status = await admin.getClusterStatus(clusters[0]);
+console.log('Healthy:', status.isHealthy);
+console.log('Nodes:', status.nodeStatuses.length);
+console.log('Leader:', status.electorInfo.leaderNode);
+
+// Domain and queue management
+const domain = await admin.getDomainInfo('bmq.test.mem.priority');
+const internals = await admin.getQueueInternals('bmq.test.mem.priority', 'orders');
+const purged = await admin.purgeQueue('bmq.test.mem.priority', 'orders');
+
+// Statistics
+const stats = await admin.getStats();
+console.log('Clients:', stats.clientsCount, 'Queues:', stats.queuesCount);
+```
+
+**Cluster Management:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `listClusters()` | `Promise<string[]>` | List active clusters |
+| `getClusterStatus(cluster)` | `Promise<ClusterStatus>` | Full cluster health |
+| `forceGcQueues(cluster)` | `Promise<string>` | GC idle queues |
+| `getClusterStorageSummary(cluster)` | `Promise<ClusterStorageSummary>` | Storage usage per partition |
+| `setPartitionState(cluster, id, enable)` | `Promise<string>` | Enable/disable partition |
+
+**Domain Management:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getDomainInfo(domain)` | `Promise<DomainInfo>` | Domain config, capacity, queues |
+| `purgeDomain(domain)` | `Promise<PurgeResult[]>` | Purge all queues in domain |
+| `purgeQueue(domain, queue, appId?)` | `Promise<PurgeResult>` | Purge specific queue |
+| `getQueueInternals(domain, queue)` | `Promise<QueueInternals>` | Handles, consumers, storage |
+| `listQueueMessages(domain, queue, offset?, count?, appId?)` | `Promise<QueueMessage[]>` | List messages |
+| `reconfigureDomain(domain)` | `Promise<string>` | Hot-reload domain config |
+
+**Statistics:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getStats()` | `Promise<BrokerStats>` | Full broker stats (clients, queues, per-queue metrics) |
+| `listTunables()` | `Promise<string>` | List tunable parameters |
+| `getTunable(param)` | `Promise<string>` | Get tunable value |
+| `setTunable(param, value)` | `Promise<string>` | Set tunable value |
+| `getBrokerConfig()` | `Promise<BrokerConfig>` | Dump broker runtime config |
+
+**Danger Zone:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `shutdown()` | `Promise<string>` | Graceful broker shutdown |
+| `terminate()` | `Promise<string>` | Immediate termination |
+
+> See [docs/broker-admin.md](./docs/broker-admin.md) for the complete type reference
+> and broker command documentation.
+
 ### Session (Low-Level)
 
 The `Session` class provides direct protocol access:
@@ -483,15 +559,22 @@ src/
 ├── producer.ts          # High-level Producer API
 ├── consumer.ts          # High-level Consumer API
 ├── admin.ts             # High-level Admin API
+├── broker-admin.ts      # Broker management API (admin port commands)
 ├── errors.ts            # Error class hierarchy
 ├── types.ts             # TypeScript interfaces
 └── index.ts             # Public API barrel export
+
+tests/
+├── protocol.test.ts     # Protocol codec unit tests
+├── broker-admin.test.ts # BrokerAdmin unit tests (45 tests, mock TCP)
+└── integration.test.ts  # Integration tests (requires live broker)
 
 docs/
 ├── architecture.md      # Layered architecture overview
 ├── protocol.md          # Wire protocol specification
 ├── transport.md         # Transport layer documentation
-└── session.md           # Session layer documentation
+├── session.md           # Session layer documentation
+└── broker-admin.md      # BrokerAdmin API documentation
 ```
 
 ---

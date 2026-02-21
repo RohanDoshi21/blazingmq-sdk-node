@@ -15,6 +15,28 @@ export { Consumer } from './consumer';
 export type { ConsumerOptions, SubscribeOptions } from './consumer';
 export { Admin } from './admin';
 export type { AdminOptions, QueueInfo } from './admin';
+export { BrokerAdmin } from './broker-admin';
+export type {
+  BrokerAdminOptions,
+  ClusterStatus,
+  ClusterNodeStatus,
+  ElectorInfo,
+  PartitionInfo,
+  ClusterQueueInfo,
+  ClusterStorageSummary,
+  DomainInfo,
+  CapacityMeter,
+  StorageQueueInfo,
+  QueueHandleInfo,
+  QueueConsumerInfo,
+  QueueInternals,
+  PurgeResult,
+  QueueMessage,
+  QueueStats,
+  DomainStats,
+  BrokerStats,
+  BrokerConfig,
+} from './broker-admin';
 
 // Types
 export {

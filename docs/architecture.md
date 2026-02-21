@@ -124,6 +124,26 @@ Each high-level API creates its own Session internally, so they are fully indepe
 A single application can run multiple Producers and Consumers simultaneously, each
 with its own TCP connection.
 
+### Standalone: BrokerAdmin (`src/broker-admin.ts`)
+
+**Responsibility:** Direct broker admin command interface.
+
+Unlike the other high-level APIs which use the BlazingMQ wire protocol,
+`BrokerAdmin` connects to the broker's **admin port** via raw TCP and sends
+text-based admin commands. This provides access to operations not available
+through the normal client protocol:
+
+- **Cluster management** — node health, elector state, partitions, storage
+- **Domain management** — config, capacity, purge, reconfigure
+- **Queue operations** — internals, message listing, per-queue purge
+- **Statistics** — broker-wide stats, per-queue metrics, tunables
+- **Broker configuration** — runtime config dump
+- **Danger zone** — shutdown, terminate
+
+`BrokerAdmin` opens a new TCP connection for each command (fire-and-forget
+pattern). It does not use the Session layer, protocol codec, or transport layer.
+See [broker-admin.md](./broker-admin.md) for the complete API reference.
+
 ## Data Flow
 
 ### Publishing a message (Producer → Broker)
