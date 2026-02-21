@@ -1,5 +1,9 @@
 # blazingmq-node
 
+[![npm](https://img.shields.io/npm/v/blazingmq-node)](https://www.npmjs.com/package/blazingmq-node)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
+
 > **Disclaimer:** This is an **unofficial, community-maintained** SDK. It is not affiliated with, endorsed by, or supported by Bloomberg LP.
 
 A pure-JavaScript Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
