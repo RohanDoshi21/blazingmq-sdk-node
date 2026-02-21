@@ -1,18 +1,11 @@
 // ============================================================================
 // BlazingMQ Node.js SDK — Broker Admin API
 //
-// Provides direct admin command interface to a BlazingMQ broker.
-// Sends admin commands and parses structured responses for:
-//   - Cluster management (status, health, nodes, partitions)
-//   - Domain management (info, purge, reconfigure, list queues)
-//   - Queue operations (purge, internals, message listing)
-//   - Statistics (broker stats, queue stats, domain stats)
-//   - Storage management (summaries, partition control)
-//   - Broker configuration inspection
+// Admin command interface to a BlazingMQ broker. Query commands use native
+// JSON output via the ENCODING JSON_COMPACT protocol flag.  Mutation and
+// text-only commands return raw strings.
 //
-// This module communicates with the broker over the BMQ binary protocol,
-// performing a full negotiation handshake before sending AdminCommand
-// control messages and receiving AdminCommandResponse payloads.
+// Types reflect the broker's native JSON structures — no custom text parsing.
 // ============================================================================
 
 import * as os from 'os';
@@ -33,7 +26,7 @@ import {
 } from './protocol/constants';
 
 // ============================================================================
-// Types
+// Types — Broker Native JSON Structures
 // ============================================================================
 
 export interface BrokerAdminOptions {
@@ -47,22 +40,33 @@ export interface BrokerAdminOptions {
 
 // --- Cluster Types ---
 
+export interface ClusterInfo {
+  locality: string;
+  name: string;
+  nodes: Array<{
+    hostName: string;
+    nodeId: number;
+    dataCenter: string;
+  }>;
+}
+
 export interface ClusterNodeStatus {
   description: string;
-  isAvailable: boolean;
-  status: string; // E_UNKNOWN, E_STARTING, E_AVAILABLE, E_STOPPING, E_UNAVAILABLE
+  status: string;
   primaryForPartitionIds: number[];
 }
 
 export interface ElectorInfo {
-  electorState: string; // DORMANT, FOLLOWER, CANDIDATE, LEADER
+  electorState: string;
   leaderNode: string;
-  leaderStatus: string; // UNDEFINED, PASSIVE, ACTIVE
-  leaderMessageSequence?: { electorTerm: number; sequenceNumber: number };
+  leaderStatus: string;
+  leaderMessageSequence?: {
+    electorTerm: number;
+    sequenceNumber: number;
+  };
 }
 
 export interface PartitionInfo {
-  partitionId: number;
   numQueuesMapped: number;
   numActiveQueues: number;
   primaryNode: string;
@@ -70,20 +74,39 @@ export interface PartitionInfo {
   primaryStatus: string;
 }
 
-export interface ClusterQueueInfo {
-  uri: string;
+export interface StorageInfo {
+  queueUri: string;
+  queueKey: string;
   partitionId: number;
-  isCreated: boolean;
-  numActiveAppIds: number;
+  numMessages: number;
+  numBytes: number;
+  isPersistent: boolean;
+  internalQueueId: number;
+}
+
+export interface FileStoreSummary {
+  primaryNodeDescription: string;
+  primaryLeaseId: number;
+  sequenceNum: number;
+  isAvailable: boolean;
+  totalMappedBytes: number;
+  numOutstandingRecords: number;
+  numUnreceiptedMessages: number;
+  storageContent: { storages: StorageInfo[] };
+  fileSets?: Array<Record<string, unknown>>;
+  activeFileSet?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface FileStoreInfo {
+  partitionId: number;
+  state: string;
+  summary: FileStoreSummary;
 }
 
 export interface ClusterStorageSummary {
-  totalMappedBytes: number;
-  fileStores: Array<{
-    partitionId: number;
-    numMappedFiles: number;
-    totalMappedBytes: number;
-  }>;
+  clusterFileStoreLocation: string;
+  fileStores: FileStoreInfo[];
 }
 
 export interface ClusterStatus {
@@ -91,10 +114,10 @@ export interface ClusterStatus {
   description: string;
   selfNodeDescription: string;
   isHealthy: boolean;
-  nodeStatuses: ClusterNodeStatus[];
+  nodeStatuses: { nodes: ClusterNodeStatus[] };
   electorInfo: ElectorInfo;
-  partitionsInfo: PartitionInfo[];
-  queuesInfo: ClusterQueueInfo[];
+  partitionsInfo: { partitions: PartitionInfo[] };
+  queuesInfo: { storages: StorageInfo[] };
   clusterStorageSummary: ClusterStorageSummary;
 }
 
@@ -102,20 +125,13 @@ export interface ClusterStatus {
 
 export interface CapacityMeter {
   name: string;
-  messages: number;
-  messageCapacity: number;
-  bytes: number;
-  byteCapacity: number;
-}
-
-export interface StorageQueueInfo {
-  queueUri: string;
-  queueKey: string;
-  partitionId: number;
+  isDisabled: boolean;
   numMessages: number;
+  messageCapacity: number;
+  numMessagesReserved: number;
   numBytes: number;
-  isPersistent: boolean;
-  internalQueueId?: number;
+  byteCapacity: number;
+  numBytesReserved: number;
 }
 
 export interface DomainInfo {
@@ -124,37 +140,62 @@ export interface DomainInfo {
   clusterName: string;
   capacityMeter: CapacityMeter;
   queueUris: string[];
-  storageContent: StorageQueueInfo[];
+  storageContent: Record<string, unknown>;
 }
 
 // --- Queue Types ---
 
-export interface QueueHandleInfo {
-  clientDescription: string;
-  handleParametersJson: string;
-  isClientClusterMember: boolean;
+export interface VirtualStorage {
+  appId: string;
+  appKey: string;
+  numMessages: number;
 }
 
-export interface QueueConsumerInfo {
-  appId: string;
-  numConsumers: number;
-  maxUnconfirmedMessages: number;
-  maxUnconfirmedBytes: number;
-  consumerPriority: number;
+export interface QueueHandle {
+  clientDescription: string;
+  parametersJson: string;
+  isClientClusterMember: boolean;
+  subStreams: Array<Record<string, unknown>>;
+}
+
+export interface QueueState {
+  uri: string;
+  handleParametersJson: string;
+  streamParametersJson: string;
+  id: number;
+  key: string;
+  partitionId: number;
+  storage: {
+    numMessages: number;
+    numBytes: number;
+    virtualStorages: VirtualStorage[];
+  };
+  capacityMeter: CapacityMeter & { parent?: CapacityMeter };
+  handles: QueueHandle[];
 }
 
 export interface QueueInternals {
-  queueUri: string;
-  state: string;
-  partitionId: number;
-  storageInfo: {
-    numMessages: number;
-    numBytes: number;
-    virtualStorages: number;
-  };
-  handles: QueueHandleInfo[];
-  consumers: QueueConsumerInfo[];
+  state: QueueState;
+  queue: Record<string, unknown>;
 }
+
+// --- Stats Types ---
+
+export interface QueueStatValues {
+  [key: string]: number;
+}
+
+export interface DomainQueueStats {
+  [queueUri: string]: { values: QueueStatValues };
+}
+
+export interface BrokerStats {
+  domainQueues: {
+    domains: Record<string, DomainQueueStats>;
+  };
+}
+
+// --- Purge Types ---
 
 export interface PurgeResult {
   queue: string;
@@ -162,6 +203,8 @@ export interface PurgeResult {
   numMessagesPurged: number;
   numBytesPurged: number;
 }
+
+// --- Message Types ---
 
 export interface QueueMessage {
   guid: string;
@@ -171,48 +214,7 @@ export interface QueueMessage {
   properties: Record<string, unknown>;
 }
 
-// --- Stats Types ---
-
-export interface QueueStats {
-  uri: string;
-  role: string; // PRIMARY, REPLICA, PROXY
-  messagesCount: number;
-  messagesCapacity: number;
-  bytesCount: number;
-  bytesCapacity: number;
-  putMessagesDelta: number;
-  putBytesDelta: number;
-  pushMessagesDelta: number;
-  pushBytesDelta: number;
-  ackMessagesDelta: number;
-  confirmMessagesDelta: number;
-  nackCount: number;
-  numProducers: number;
-  numConsumers: number;
-  ackTimeAvg: number;
-  ackTimeMax: number;
-  confirmTimeAvg: number;
-  confirmTimeMax: number;
-  queueTimeAvg: number;
-  queueTimeMax: number;
-}
-
-export interface DomainStats {
-  name: string;
-  configuredMessages: number;
-  configuredBytes: number;
-  queueCount: number;
-  queueCountOpen: number;
-}
-
-export interface BrokerStats {
-  clientsCount: number;
-  queuesCount: number;
-  domains: DomainStats[];
-  queues: QueueStats[];
-}
-
-// --- Broker Config Types ---
+// --- Config Types ---
 
 export interface BrokerConfig {
   raw: string;
@@ -226,25 +228,13 @@ export interface BrokerConfig {
 /**
  * Admin client for sending management commands to a BlazingMQ broker.
  *
- * Connects to the broker's admin port and provides a structured API
- * for all admin operations: cluster management, domain management,
- * queue operations, statistics, and configuration.
+ * Query commands use `ENCODING JSON_COMPACT` for native JSON responses.
+ * Mutation commands (purge, reconfigure, GC, shutdown) return raw text.
  *
  * @example
  * ```typescript
  * const admin = new BrokerAdmin({ host: 'localhost', port: 30114 });
- *
- * // Get cluster status
  * const clusters = await admin.listClusters();
- * const status = await admin.getClusterStatus('my-cluster');
- *
- * // Get domain info
- * const domainInfo = await admin.getDomainInfo('bmq.test.mem.priority');
- *
- * // Purge a queue
- * const result = await admin.purgeQueue('bmq.test.mem.priority', 'my-queue');
- *
- * // Get statistics
  * const stats = await admin.getStats();
  * ```
  */
@@ -260,16 +250,15 @@ export class BrokerAdmin extends EventEmitter {
     };
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Low-Level Command Execution
-  // ============================================================================
+  // ==========================================================================
 
   /**
-   * Send a raw admin command to the broker and return the response.
+   * Send a raw admin command to the broker and return the text response.
    *
-   * For each command a new TCP connection is opened, the BMQ protocol
-   * negotiation is performed, an AdminCommand control message is sent,
-   * and the AdminCommandResponse is awaited before disconnecting.
+   * Opens a new TCP connection, performs BMQ protocol negotiation,
+   * sends an AdminCommand, and awaits the AdminCommandResponse.
    */
   async sendCommand(command: string): Promise<string> {
     const conn = new BmqConnection({
@@ -279,15 +268,11 @@ export class BrokerAdmin extends EventEmitter {
       reconnect: false,
     });
 
-    // Prevent Node.js from throwing on the EventEmitter 'error' event.
-    // Connection errors are surfaced via the rejected connect() promise.
     conn.on('error', () => {});
 
     try {
-      // 1. Connect
       await conn.connect();
 
-      // 2. Negotiate — send ClientIdentity as TCPADMIN, await BrokerResponse
       const clientIdentity = {
         clientIdentity: {
           protocolVersion: PROTOCOL_VERSION,
@@ -301,40 +286,45 @@ export class BrokerAdmin extends EventEmitter {
           clusterName: '',
           clusterNodeId: -1,
           sdkLanguage: 'E_JAVA',
-          guidInfo: {
-            clientId: '',
-            nanoSecondsFromEpoch: 0,
-          },
+          guidInfo: { clientId: '', nanoSecondsFromEpoch: 0 },
           userAgent: `${SDK_NAME}/${SDK_VERSION_STRING} (admin)`,
         },
       };
 
       conn.send(buildControlEvent(clientIdentity));
 
-      const negoResponse = await this.waitForEvent(conn, EventType.CONTROL, this.options.timeout);
+      const negoResponse = await this.waitForEvent(
+        conn,
+        EventType.CONTROL,
+        this.options.timeout,
+      );
       const negoParsed = parseControlPayload(negoResponse);
 
-      if (negoParsed.brokerResponse?.result?.category &&
-          negoParsed.brokerResponse.result.category !== 'E_SUCCESS') {
+      if (
+        negoParsed.brokerResponse?.result?.category &&
+        negoParsed.brokerResponse.result.category !== 'E_SUCCESS'
+      ) {
         throw new Error(
-          `Broker rejected negotiation: ${negoParsed.brokerResponse.result.message || negoParsed.brokerResponse.result.category}`,
+          `Broker rejected negotiation: ${
+            negoParsed.brokerResponse.result.message ||
+            negoParsed.brokerResponse.result.category
+          }`,
         );
       }
 
-      // 3. Send AdminCommand
-      const rId = 1;
-      const adminMsg = {
-        rId,
-        adminCommand: { command },
-      };
-      conn.send(buildControlEvent(adminMsg));
+      conn.send(buildControlEvent({ rId: 1, adminCommand: { command } }));
 
-      // 4. Await AdminCommandResponse
-      const responseBuf = await this.waitForEvent(conn, EventType.CONTROL, this.options.timeout);
+      const responseBuf = await this.waitForEvent(
+        conn,
+        EventType.CONTROL,
+        this.options.timeout,
+      );
       const responseParsed = parseControlPayload(responseBuf);
-      const text = responseParsed.adminCommandResponse?.text ?? responseParsed.raw ?? '';
+      const text =
+        responseParsed.adminCommandResponse?.text ??
+        responseParsed.raw ??
+        '';
 
-      // 5. Graceful disconnect
       try {
         conn.send(buildControlEvent({ rId: 2, disconnect: {} }));
       } catch {
@@ -352,8 +342,25 @@ export class BrokerAdmin extends EventEmitter {
   }
 
   /**
+   * Send a command with ENCODING JSON_COMPACT and parse the JSON response.
+   * Throws if the broker does not return valid JSON.
+   */
+  private async sendJsonCommand<T = unknown>(command: string): Promise<T> {
+    const response = await this.sendCommand(
+      `ENCODING JSON_COMPACT ${command}`,
+    );
+    try {
+      return JSON.parse(response) as T;
+    } catch {
+      throw new Error(
+        `Expected JSON response for "${command}": ${response.substring(0, 200)}`,
+      );
+    }
+  }
+
+  /**
    * Wait for a specific event type from the connection.
-   * Automatically responds to HEARTBEAT_REQ events while waiting.
+   * Automatically responds to heartbeat requests.
    */
   private waitForEvent(
     conn: BmqConnection,
@@ -367,12 +374,11 @@ export class BrokerAdmin extends EventEmitter {
       }, timeoutMs);
 
       const handler = (type: EventType, data: Buffer) => {
-        // Auto-reply to heartbeat requests to keep the connection alive
         if (type === EventType.HEARTBEAT_REQ) {
           try {
             conn.send(buildHeartbeatResponse());
           } catch {
-            // Ignore — connection may be closing
+            // Ignore
           }
           return;
         }
@@ -388,26 +394,11 @@ export class BrokerAdmin extends EventEmitter {
     });
   }
 
-  /**
-   * Send a command and parse the JSON response.
-   */
-  private async sendJsonCommand(command: string): Promise<any> {
-    const response = await this.sendCommand(command);
-    try {
-      return JSON.parse(response);
-    } catch {
-      // If not JSON, return as raw
-      return { raw: response };
-    }
-  }
-
-  // ============================================================================
+  // ==========================================================================
   // Health & Connectivity
-  // ============================================================================
+  // ==========================================================================
 
-  /**
-   * Ping the broker to check connectivity.
-   */
+  /** Ping the broker to verify connectivity. */
   async ping(): Promise<boolean> {
     try {
       await this.sendCommand('HELP');
@@ -417,84 +408,61 @@ export class BrokerAdmin extends EventEmitter {
     }
   }
 
-  /**
-   * Get help text listing all supported commands.
-   */
+  /** Get help text listing all supported admin commands. */
   async help(): Promise<string> {
     return this.sendCommand('HELP');
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Cluster Management
-  // ============================================================================
+  // ==========================================================================
 
-  /**
-   * List all active clusters.
-   */
-  async listClusters(): Promise<string[]> {
-    const response = await this.sendCommand('CLUSTERS LIST');
-    try {
-      const parsed = JSON.parse(response);
-      return parsed.clusters || [];
-    } catch {
-      // Parse from text format:
-      //   The following clusters are active:
-      //       [LOCAL ] local:
-      //           localhost           0      UNSPECIFIED
-      const names: string[] = [];
-      const lines = response.split('\n');
-      for (const line of lines) {
-        const match = line.match(/^\s+\[\s*\w+\s*\]\s+(\S+?):/);
-        if (match) {
-          names.push(match[1]);
-        }
-      }
-      return names;
-    }
+  /** List all active clusters and their nodes. */
+  async listClusters(): Promise<ClusterInfo[]> {
+    const result = await this.sendJsonCommand<{
+      clusterList?: { clusters?: ClusterInfo[] };
+    }>('CLUSTERS LIST');
+    return result.clusterList?.clusters ?? [];
   }
 
-  /**
-   * Get detailed status of a specific cluster.
-   */
+  /** Get detailed status for a specific cluster. */
   async getClusterStatus(clusterName: string): Promise<ClusterStatus> {
-    const response = await this.sendJsonCommand(
-      `CLUSTERS CLUSTER ${clusterName} STATUS`
-    );
-    return this.parseClusterStatus(clusterName, response);
+    const result = await this.sendJsonCommand<{
+      clusterStatus?: ClusterStatus;
+    }>(`CLUSTERS CLUSTER ${clusterName} STATUS`);
+    if (!result.clusterStatus) {
+      throw new Error(`No status returned for cluster "${clusterName}"`);
+    }
+    return result.clusterStatus;
   }
 
-  /**
-   * Force garbage collection of idle queues in a cluster.
-   */
+  /** Force garbage collection of idle queues. */
   async forceGcQueues(clusterName: string): Promise<string> {
-    return this.sendCommand(`CLUSTERS CLUSTER ${clusterName} FORCE_GC_QUEUES`);
-  }
-
-  /**
-   * Get storage summary for a cluster.
-   */
-  async getClusterStorageSummary(clusterName: string): Promise<ClusterStorageSummary> {
-    const response = await this.sendJsonCommand(
-      `CLUSTERS CLUSTER ${clusterName} STORAGE SUMMARY`
+    return this.sendCommand(
+      `CLUSTERS CLUSTER ${clusterName} FORCE_GC_QUEUES`,
     );
-    return response as ClusterStorageSummary;
   }
 
-  /**
-   * Get partition details for a cluster.
-   */
+  /** Get storage summary for a cluster. */
+  async getClusterStorageSummary(
+    clusterName: string,
+  ): Promise<unknown> {
+    return this.sendJsonCommand(
+      `CLUSTERS CLUSTER ${clusterName} STORAGE SUMMARY`,
+    );
+  }
+
+  /** Get summary for a specific partition. */
   async getPartitionSummary(
     clusterName: string,
     partitionId: number,
-  ): Promise<any> {
+  ): Promise<unknown> {
     return this.sendJsonCommand(
-      `CLUSTERS CLUSTER ${clusterName} STORAGE PARTITION ${partitionId} SUMMARY`
+      `CLUSTERS CLUSTER ${clusterName} STORAGE PARTITION ${partitionId} SUMMARY`,
     );
   }
 
-  /**
-   * Enable or disable a partition.
-   */
+  /** Enable or disable a partition. */
   async setPartitionState(
     clusterName: string,
     partitionId: number,
@@ -502,77 +470,68 @@ export class BrokerAdmin extends EventEmitter {
   ): Promise<string> {
     const action = enable ? 'ENABLE' : 'DISABLE';
     return this.sendCommand(
-      `CLUSTERS CLUSTER ${clusterName} STORAGE PARTITION ${partitionId} ${action}`
+      `CLUSTERS CLUSTER ${clusterName} STORAGE PARTITION ${partitionId} ${action}`,
     );
   }
 
-  /**
-   * Get queue status in storage for a domain within a cluster.
-   */
+  /** Get queue status in storage for a domain within a cluster. */
   async getStorageQueueStatus(
     clusterName: string,
     domainName: string,
-  ): Promise<StorageQueueInfo[]> {
-    const response = await this.sendJsonCommand(
-      `CLUSTERS CLUSTER ${clusterName} STORAGE DOMAIN ${domainName} QUEUE_STATUS`
+  ): Promise<unknown> {
+    return this.sendJsonCommand(
+      `CLUSTERS CLUSTER ${clusterName} STORAGE DOMAIN ${domainName} QUEUE_STATUS`,
     );
-    return response.queues || [];
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Domain Management
-  // ============================================================================
+  // ==========================================================================
 
-  /**
-   * Get detailed info about a domain, including config and queues.
-   */
+  /** Get detailed info about a domain including config and queues. */
   async getDomainInfo(domainName: string): Promise<DomainInfo> {
-    const response = await this.sendJsonCommand(
-      `DOMAINS DOMAIN ${domainName} INFOS`
-    );
-    return this.parseDomainInfo(domainName, response);
+    const result = await this.sendJsonCommand<{
+      domainInfo?: DomainInfo;
+    }>(`DOMAINS DOMAIN ${domainName} INFOS`);
+    if (!result.domainInfo) {
+      throw new Error(`No info returned for domain "${domainName}"`);
+    }
+    return result.domainInfo;
   }
 
-  /**
-   * Purge all queues in a domain.
-   */
-  async purgeDomain(domainName: string): Promise<PurgeResult[]> {
-    const response = await this.sendJsonCommand(
-      `DOMAINS DOMAIN ${domainName} PURGE`
-    );
-    return response.purgedQueues || [response];
+  /** Purge all queues in a domain. Returns raw response text. */
+  async purgeDomain(domainName: string): Promise<string> {
+    return this.sendCommand(`DOMAINS DOMAIN ${domainName} PURGE`);
   }
 
-  /**
-   * Purge a specific queue in a domain.
-   */
+  /** Purge a specific queue. Returns raw response text. */
   async purgeQueue(
     domainName: string,
     queueName: string,
     appId: string = '*',
-  ): Promise<PurgeResult> {
-    const response = await this.sendJsonCommand(
-      `DOMAINS DOMAIN ${domainName} QUEUE ${queueName} PURGE APPID ${appId}`
+  ): Promise<string> {
+    return this.sendCommand(
+      `DOMAINS DOMAIN ${domainName} QUEUE ${queueName} PURGE APPID ${appId}`,
     );
-    return response as PurgeResult;
   }
 
-  /**
-   * Get queue internals (handles, consumers, routing info).
-   */
+  /** Get queue internals (handles, consumers, routing, storage). */
   async getQueueInternals(
     domainName: string,
     queueName: string,
   ): Promise<QueueInternals> {
-    const response = await this.sendJsonCommand(
-      `DOMAINS DOMAIN ${domainName} QUEUE ${queueName} INTERNALS`
-    );
-    return response as QueueInternals;
+    const result = await this.sendJsonCommand<{
+      queueInternals?: QueueInternals;
+    }>(`DOMAINS DOMAIN ${domainName} QUEUE ${queueName} INTERNALS`);
+    if (!result.queueInternals) {
+      throw new Error(
+        `No internals returned for queue "${queueName}" in domain "${domainName}"`,
+      );
+    }
+    return result.queueInternals;
   }
 
-  /**
-   * List messages in a queue.
-   */
+  /** List messages in a queue. */
   async listQueueMessages(
     domainName: string,
     queueName: string,
@@ -581,67 +540,61 @@ export class BrokerAdmin extends EventEmitter {
     appId?: string,
   ): Promise<QueueMessage[]> {
     const appIdPart = appId ? ` ${appId}` : '';
-    const response = await this.sendJsonCommand(
-      `DOMAINS DOMAIN ${domainName} QUEUE ${queueName} LIST${appIdPart} ${offset} ${count}`
+    const response = await this.sendJsonCommand<{ messages?: QueueMessage[] }>(
+      `DOMAINS DOMAIN ${domainName} QUEUE ${queueName} LIST${appIdPart} ${offset} ${count}`,
     );
-    return response.messages || [];
+    return response.messages ?? [];
   }
 
-  /**
-   * Hot-reload domain configuration from disk.
-   */
+  /** Hot-reload domain configuration from disk. */
   async reconfigureDomain(domainName: string): Promise<string> {
     return this.sendCommand(`DOMAINS RECONFIGURE ${domainName}`);
   }
 
-  /**
-   * Clear domain resolver cache.
-   */
+  /** Clear domain resolver cache. */
   async clearDomainCache(domainName?: string): Promise<string> {
     const target = domainName ?? 'ALL';
     return this.sendCommand(`DOMAINS RESOLVER CACHE_CLEAR ${target}`);
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Statistics
-  // ============================================================================
+  // ==========================================================================
 
   /**
    * Get all broker statistics.
+   *
+   * The broker returns a double-encoded response: the outer JSON has a
+   * `stats` field containing a stringified inner JSON object with the
+   * actual domain/queue statistics.
    */
   async getStats(): Promise<BrokerStats> {
-    const response = await this.sendCommand('STAT SHOW');
-    return this.parseStats(response);
+    const result = await this.sendJsonCommand<{ stats: string }>(
+      'STAT SHOW',
+    );
+    return JSON.parse(result.stats) as BrokerStats;
   }
 
-  /**
-   * List tunable stat parameters.
-   */
+  /** List tunable stat parameters. */
   async listTunables(): Promise<string> {
     return this.sendCommand('STAT LIST_TUNABLES');
   }
 
-  /**
-   * Get a stat tunable value.
-   */
+  /** Get a stat tunable value. */
   async getTunable(param: string): Promise<string> {
     return this.sendCommand(`STAT GET ${param}`);
   }
 
-  /**
-   * Set a stat tunable value.
-   */
+  /** Set a stat tunable value. */
   async setTunable(param: string, value: string | number): Promise<string> {
     return this.sendCommand(`STAT SET ${param} ${value}`);
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Broker Configuration
-  // ============================================================================
+  // ==========================================================================
 
-  /**
-   * Dump the current broker configuration.
-   */
+  /** Dump the current broker configuration. */
   async getBrokerConfig(): Promise<BrokerConfig> {
     const response = await this.sendCommand('BROKERCONFIG DUMP');
     try {
@@ -651,229 +604,17 @@ export class BrokerAdmin extends EventEmitter {
     }
   }
 
-  // ============================================================================
+  // ==========================================================================
   // Danger Zone
-  // ============================================================================
+  // ==========================================================================
 
-  /**
-   * Initiate a graceful broker shutdown.
-   */
+  /** Initiate a graceful broker shutdown. */
   async shutdown(): Promise<string> {
     return this.sendCommand('DANGER SHUTDOWN');
   }
 
-  /**
-   * Terminate the broker immediately.
-   */
+  /** Terminate the broker immediately. */
   async terminate(): Promise<string> {
     return this.sendCommand('DANGER TERMINATE');
-  }
-
-  // ============================================================================
-  // Response Parsers
-  // ============================================================================
-
-  private parseClusterStatus(name: string, data: any): ClusterStatus {
-    if (data.raw) {
-      // Parse the text-format cluster status output
-      const text: string = data.raw;
-      const isHealthy = /Is Healthy\s*:\s*Yes/i.test(text);
-
-      // Parse nodes
-      const nodeStatuses: ClusterNodeStatus[] = [];
-      const nodeRegex = /\[([^\]]+)\]\s*\n\s*IsConnected:\s*(\S+)\s*\n\s*Node Status:\s*(\S+)\s*\n\s*Primary for partitions:\s*\[([^\]]*)\]/g;
-      let nodeMatch;
-      while ((nodeMatch = nodeRegex.exec(text)) !== null) {
-        const partitions = nodeMatch[4].trim()
-          ? nodeMatch[4].trim().split(/\s+/).map(Number)
-          : [];
-        nodeStatuses.push({
-          description: nodeMatch[1].trim(),
-          isAvailable: nodeMatch[3].trim() === 'E_AVAILABLE',
-          status: nodeMatch[3].trim(),
-          primaryForPartitionIds: partitions,
-        });
-      }
-
-      // Parse elector info
-      const electorState = text.match(/Self State\s*:\s*(\S+)/)?.[1] ?? 'UNKNOWN';
-      const leaderNode = text.match(/Leader Node\s*:\s*(.+)/)?.[1]?.trim() ?? '';
-      const leaderStatus = text.match(/Leader Status\s*:\s*(\S+)/)?.[1] ?? 'UNDEFINED';
-
-      // Parse partitions
-      const partitionsInfo: PartitionInfo[] = [];
-      const partRegex = /PartitionId:\s*(\d+)\s*\n\s*Num Queues\s*:\s*mapped\s*\((\d+)\),\s*active\s*\((\d+)\)\s*\n\s*Primary Node\s*:\s*(.+)\n\s*Primary LeaseId:\s*(\d+)\s*\n\s*Primary Status\s*:\s*(\S+)/g;
-      let partMatch;
-      while ((partMatch = partRegex.exec(text)) !== null) {
-        partitionsInfo.push({
-          partitionId: parseInt(partMatch[1], 10),
-          numQueuesMapped: parseInt(partMatch[2], 10),
-          numActiveQueues: parseInt(partMatch[3], 10),
-          primaryNode: partMatch[4].trim(),
-          primaryLeaseId: parseInt(partMatch[5], 10),
-          primaryStatus: partMatch[6].trim(),
-        });
-      }
-
-      return {
-        name,
-        description: text,
-        selfNodeDescription: '',
-        isHealthy,
-        nodeStatuses,
-        electorInfo: {
-          electorState,
-          leaderNode,
-          leaderStatus,
-        },
-        partitionsInfo,
-        queuesInfo: [],
-        clusterStorageSummary: { totalMappedBytes: 0, fileStores: [] },
-      };
-    }
-
-    return {
-      name,
-      description: data.description ?? '',
-      selfNodeDescription: data.selfNodeDescription ?? '',
-      isHealthy: data.isHealthy ?? true,
-      nodeStatuses: (data.nodeStatuses ?? []).map((n: any) => ({
-        description: n.description ?? '',
-        isAvailable: n.isAvailable ?? false,
-        status: n.status ?? 'E_UNKNOWN',
-        primaryForPartitionIds: n.primaryForPartitionIds ?? [],
-      })),
-      electorInfo: {
-        electorState: data.electorInfo?.electorState ?? 'UNKNOWN',
-        leaderNode: data.electorInfo?.leaderNode ?? '',
-        leaderStatus: data.electorInfo?.leaderStatus ?? 'UNDEFINED',
-      },
-      partitionsInfo: (data.partitionsInfo ?? []).map((p: any) => ({
-        partitionId: p.partitionId ?? 0,
-        numQueuesMapped: p.numQueuesMapped ?? 0,
-        numActiveQueues: p.numActiveQueues ?? 0,
-        primaryNode: p.primaryNode ?? '',
-        primaryLeaseId: p.primaryLeaseId ?? 0,
-        primaryStatus: p.primaryStatus ?? '',
-      })),
-      queuesInfo: (data.queuesInfo ?? []).map((q: any) => ({
-        uri: q.uri ?? q.queueUri ?? '',
-        partitionId: q.partitionId ?? 0,
-        isCreated: q.isCreated ?? false,
-        numActiveAppIds: q.numActiveAppIds ?? 0,
-      })),
-      clusterStorageSummary: data.clusterStorageSummary ?? {
-        totalMappedBytes: 0,
-        fileStores: [],
-      },
-    };
-  }
-
-  private parseDomainInfo(name: string, data: any): DomainInfo {
-    if (data.raw) {
-      return {
-        name,
-        configJson: '{}',
-        clusterName: '',
-        capacityMeter: {
-          name,
-          messages: 0,
-          messageCapacity: 0,
-          bytes: 0,
-          byteCapacity: 0,
-        },
-        queueUris: [],
-        storageContent: [],
-      };
-    }
-
-    return {
-      name: data.name ?? name,
-      configJson: data.configJson ?? JSON.stringify(data.config ?? {}),
-      clusterName: data.clusterName ?? '',
-      capacityMeter: {
-        name: data.capacityMeter?.name ?? name,
-        messages: data.capacityMeter?.messages ?? 0,
-        messageCapacity: data.capacityMeter?.messageCapacity ?? 0,
-        bytes: data.capacityMeter?.bytes ?? 0,
-        byteCapacity: data.capacityMeter?.byteCapacity ?? 0,
-      },
-      queueUris: data.queueUris ?? [],
-      storageContent: (data.storageContent ?? []).map((s: any) => ({
-        queueUri: s.queueUri ?? '',
-        queueKey: s.queueKey ?? '',
-        partitionId: s.partitionId ?? 0,
-        numMessages: s.numMessages ?? 0,
-        numBytes: s.numBytes ?? 0,
-        isPersistent: s.isPersistent ?? false,
-        internalQueueId: s.internalQueueId,
-      })),
-    };
-  }
-
-  private parseStats(raw: string): BrokerStats {
-    const stats: BrokerStats = {
-      clientsCount: 0,
-      queuesCount: 0,
-      domains: [],
-      queues: [],
-    };
-
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed.broker) {
-        stats.clientsCount = parsed.broker.clientsCount ?? 0;
-        stats.queuesCount = parsed.broker.queuesCount ?? 0;
-      }
-      if (parsed.domains) {
-        stats.domains = parsed.domains.map((d: any) => ({
-          name: d.name ?? '',
-          configuredMessages: d.configuredMessages ?? 0,
-          configuredBytes: d.configuredBytes ?? 0,
-          queueCount: d.queueCount ?? 0,
-          queueCountOpen: d.queueCountOpen ?? 0,
-        }));
-      }
-      if (parsed.queues) {
-        stats.queues = parsed.queues.map((q: any) => this.parseQueueStats(q));
-      }
-    } catch {
-      // Parse from text format
-      const lines = raw.split('\n');
-      for (const line of lines) {
-        const clientMatch = line.match(/clients?\s*:\s*(\d+)/i);
-        if (clientMatch) stats.clientsCount = parseInt(clientMatch[1], 10);
-        const queueMatch = line.match(/queues?\s*:\s*(\d+)/i);
-        if (queueMatch) stats.queuesCount = parseInt(queueMatch[1], 10);
-      }
-    }
-
-    return stats;
-  }
-
-  private parseQueueStats(data: any): QueueStats {
-    return {
-      uri: data.uri ?? data.queueUri ?? '',
-      role: data.role ?? 'UNKNOWN',
-      messagesCount: data.messagesCount ?? data.messages_current ?? 0,
-      messagesCapacity: data.messagesCapacity ?? data.messages_max ?? 0,
-      bytesCount: data.bytesCount ?? data.bytes_current ?? 0,
-      bytesCapacity: data.bytesCapacity ?? data.bytes_max ?? 0,
-      putMessagesDelta: data.putMessagesDelta ?? data.put_messages_delta ?? 0,
-      putBytesDelta: data.putBytesDelta ?? data.put_bytes_delta ?? 0,
-      pushMessagesDelta: data.pushMessagesDelta ?? data.push_messages_delta ?? 0,
-      pushBytesDelta: data.pushBytesDelta ?? data.push_bytes_delta ?? 0,
-      ackMessagesDelta: data.ackMessagesDelta ?? data.ack_delta ?? 0,
-      confirmMessagesDelta: data.confirmMessagesDelta ?? data.confirm_delta ?? 0,
-      nackCount: data.nackCount ?? data.nack ?? 0,
-      numProducers: data.numProducers ?? data.nb_producer ?? 0,
-      numConsumers: data.numConsumers ?? data.nb_consumer ?? 0,
-      ackTimeAvg: data.ackTimeAvg ?? data.ack_time_avg ?? 0,
-      ackTimeMax: data.ackTimeMax ?? data.ack_time_max ?? 0,
-      confirmTimeAvg: data.confirmTimeAvg ?? data.confirm_time_avg ?? 0,
-      confirmTimeMax: data.confirmTimeMax ?? data.confirm_time_max ?? 0,
-      queueTimeAvg: data.queueTimeAvg ?? data.queue_time_avg ?? 0,
-      queueTimeMax: data.queueTimeMax ?? data.queue_time_max ?? 0,
-    };
   }
 }

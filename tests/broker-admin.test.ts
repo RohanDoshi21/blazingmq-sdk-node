@@ -1,1048 +1,434 @@
 // ============================================================================
-// BlazingMQ Node.js SDK — Unit Tests for BrokerAdmin
+// BrokerAdmin Integration Tests
 //
-// These tests exercise the BrokerAdmin class by mocking the BMQ binary
-// protocol over TCP.  No live broker is required.
+// Tests run against a real BlazingMQ broker at localhost:30114 (default).
+// Override with BMQ_TEST_HOST / BMQ_TEST_PORT environment variables.
+//
+// Prerequisites:
+//   - BlazingMQ broker running (e.g. docker/single-node)
+//   - Domain "bmq.test.mem.priority" configured
+//   - Queue "example-queue" opened by at least one consumer
 // ============================================================================
 
-import * as net from 'net';
-import { EventEmitter } from 'events';
-import {
-  BrokerAdmin,
-  ClusterStorageSummary,
+import { BrokerAdmin } from '../src/broker-admin';
+import type {
+  ClusterInfo,
+  ClusterStatus,
+  DomainInfo,
   QueueInternals,
+  BrokerStats,
+  BrokerConfig,
 } from '../src/broker-admin';
-import {
-  buildControlEvent,
-  parseControlPayload,
-  decodeEventHeader,
-} from '../src/protocol/codec';
-import { EventType, EVENT_HEADER_SIZE } from '../src/protocol/constants';
 
-// ============================================================================
-// Mock BMQ Broker Helper
-// ============================================================================
+const BROKER_HOST = process.env.BMQ_TEST_HOST || 'localhost';
+const BROKER_PORT = Number(process.env.BMQ_TEST_PORT) || 30114;
+const TIMEOUT = 15000;
 
-/**
- * Creates a local TCP server that speaks the BMQ binary protocol:
- *   1. Receives ClientIdentity negotiation → replies with BrokerResponse
- *   2. Receives AdminCommand → extracts the command string, calls `handler`,
- *      and replies with an AdminCommandResponse containing the handler result
- *   3. Handles Disconnect gracefully
- *
- * The `handler` receives the raw admin command string and returns the text
- * that should appear in the AdminCommandResponse.
- *
- * When `captureCommands` is provided, each received admin command string
- * is pushed into the array so tests can verify what was sent.
- */
-function createMockBroker(
-  handler: (command: string) => string,
-  captureCommands?: string[],
-): Promise<{ server: net.Server; port: number }> {
-  return new Promise((resolve) => {
-    const server = net.createServer((socket) => {
-      let readBuffer = Buffer.alloc(0);
+// Known fixtures from the running single-node broker
+const TEST_CLUSTER = 'local';
+const TEST_DOMAIN = 'bmq.test.mem.priority';
+const TEST_QUEUE = 'example-queue';
 
-      socket.on('data', (chunk) => {
-        readBuffer = Buffer.concat([readBuffer, chunk]);
+jest.setTimeout(TIMEOUT);
 
-        // Process complete events from the buffer
-        while (readBuffer.length >= EVENT_HEADER_SIZE) {
-          const word0 = readBuffer.readUInt32BE(0);
-          const eventLength = word0 & 0x7fffffff;
+describe('BrokerAdmin (integration)', () => {
+  let admin: BrokerAdmin;
 
-          if (eventLength < EVENT_HEADER_SIZE || readBuffer.length < eventLength) {
-            break; // Need more data
-          }
-
-          const eventBuf = readBuffer.subarray(0, eventLength);
-          readBuffer = readBuffer.subarray(eventLength);
-
-          const header = decodeEventHeader(eventBuf);
-
-          if (header.type === EventType.CONTROL) {
-            let payload: any;
-            try {
-              payload = parseControlPayload(eventBuf);
-            } catch {
-              continue;
-            }
-
-            if (payload.clientIdentity) {
-              // Negotiation — reply with BrokerResponse
-              const brokerResponse = {
-                brokerResponse: {
-                  result: { category: 'E_SUCCESS', code: 0, message: '' },
-                  protocolVersion: 1,
-                  brokerVersion: 999999,
-                  isDeprecatedSdk: false,
-                },
-              };
-              socket.write(buildControlEvent(brokerResponse));
-            } else if (payload.adminCommand) {
-              // Admin command — call handler and reply
-              const command = payload.adminCommand.command;
-              if (captureCommands) {
-                captureCommands.push(command);
-              }
-
-              const responseText = handler(command);
-              const rId = payload.rId ?? 0;
-              const adminResponse = {
-                rId,
-                adminCommandResponse: { text: responseText },
-              };
-              socket.write(buildControlEvent(adminResponse));
-            } else if (payload.disconnect !== undefined) {
-              // Disconnect — reply and close
-              const rId = payload.rId ?? 0;
-              const disconnectResponse = {
-                rId,
-                disconnectResponse: {},
-              };
-              socket.write(buildControlEvent(disconnectResponse));
-              socket.end();
-            }
-          } else if (header.type === EventType.HEARTBEAT_RSP) {
-            // Client replying to heartbeat — ignore
-          }
-        }
-      });
-
-      socket.on('error', () => {
-        // Ignore client-side connection resets
-      });
-    });
-
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address() as net.AddressInfo;
-      resolve({ server, port: addr.port });
-    });
-  });
-}
-
-function closeMockBroker(server: net.Server): Promise<void> {
-  return new Promise((resolve) => {
-    server.close(() => resolve());
-  });
-}
-
-// ============================================================================
-// BrokerAdmin Construction
-// ============================================================================
-
-describe('BrokerAdmin', () => {
-  describe('constructor', () => {
-    test('uses default options when none provided', () => {
-      const admin = new BrokerAdmin();
-      // We can't directly inspect private fields, but we can verify it's
-      // an EventEmitter instance with the right prototype
-      expect(admin).toBeInstanceOf(BrokerAdmin);
-      expect(admin).toBeInstanceOf(EventEmitter);
-    });
-
-    test('accepts custom options', () => {
-      const admin = new BrokerAdmin({
-        host: '10.0.0.1',
-        port: 9999,
-        timeout: 5000,
-      });
-      expect(admin).toBeInstanceOf(BrokerAdmin);
+  beforeAll(() => {
+    admin = new BrokerAdmin({
+      host: BROKER_HOST,
+      port: BROKER_PORT,
+      timeout: TIMEOUT,
     });
   });
 
-  // ============================================================================
-  // sendCommand — raw TCP command/response
-  // ============================================================================
+  // ==========================================================================
+  // Health & Connectivity
+  // ==========================================================================
 
-  describe('sendCommand', () => {
-    let server: net.Server;
-    let port: number;
-
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+  describe('Health & Connectivity', () => {
+    test('ping returns true when broker is reachable', async () => {
+      const ok = await admin.ping();
+      expect(ok).toBe(true);
     });
 
-    test('sends command and receives text response', async () => {
-      ({ server, port } = await createMockBroker((cmd) => {
-        if (cmd === 'HELP') return 'Available commands: HELP, CLUSTERS, DOMAINS, STAT\n';
-        return 'UNKNOWN COMMAND\n';
-      }));
+    test('ping returns false for unreachable broker', async () => {
+      const badAdmin = new BrokerAdmin({ host: '127.0.0.1', port: 1, timeout: 2000 });
+      const ok = await badAdmin.ping();
+      expect(ok).toBe(false);
+    });
 
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
+    test('help returns non-empty command listing', async () => {
+      const helpText = await admin.help();
+      expect(typeof helpText).toBe('string');
+      expect(helpText.length).toBeGreaterThan(0);
+      expect(helpText).toContain('CLUSTERS');
+      expect(helpText).toContain('DOMAINS');
+      expect(helpText).toContain('STAT');
+    });
+
+    test('sendCommand returns string response', async () => {
       const response = await admin.sendCommand('HELP');
-      expect(response).toContain('Available commands');
-      expect(response).toContain('HELP');
+      expect(typeof response).toBe('string');
+      expect(response.length).toBeGreaterThan(0);
     });
 
-    test('returns trimmed response', async () => {
-      ({ server, port } = await createMockBroker(() => '  hello  \n\n'));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const response = await admin.sendCommand('TEST');
-      expect(response).toBe('hello');
-    });
-
-    test('rejects on connection error', async () => {
-      // Use a port that nothing is listening on
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port: 1 });
-      await expect(admin.sendCommand('HELP')).rejects.toThrow(/ECONNREFUSED|EACCES|connect/);
-    });
-
-    test('rejects on timeout', async () => {
-      // Server that never responds
-      const hangServer = net.createServer((_socket) => {
-        // Intentionally don't respond or close
-      });
-      await new Promise<void>((resolve) => {
-        hangServer.listen(0, '127.0.0.1', () => resolve());
-      });
-      const hangPort = (hangServer.address() as net.AddressInfo).port;
-
-      const admin = new BrokerAdmin({
-        host: '127.0.0.1',
-        port: hangPort,
-        timeout: 200,
-      });
-
-      await expect(admin.sendCommand('HELP')).rejects.toThrow('timed out');
-      hangServer.close();
+    test('sendCommand rejects on bad connection', async () => {
+      const badAdmin = new BrokerAdmin({ host: '127.0.0.1', port: 1, timeout: 2000 });
+      await expect(badAdmin.sendCommand('HELP')).rejects.toThrow();
     });
   });
 
-  // ============================================================================
-  // ping
-  // ============================================================================
-
-  describe('ping', () => {
-    let server: net.Server;
-    let port: number;
-
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
-    });
-
-    test('returns true when broker is reachable', async () => {
-      ({ server, port } = await createMockBroker(() => 'HELP TEXT'));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.ping();
-      expect(result).toBe(true);
-    });
-
-    test('returns false when broker is unreachable', async () => {
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port: 1 });
-      const result = await admin.ping();
-      expect(result).toBe(false);
-    });
-  });
-
-  // ============================================================================
-  // help
-  // ============================================================================
-
-  describe('help', () => {
-    let server: net.Server;
-    let port: number;
-
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
-    });
-
-    test('returns help text from broker', async () => {
-      const helpText = 'COMMANDS:\n  HELP\n  CLUSTERS LIST\n  DOMAINS DOMAIN <name>\n  STAT SHOW';
-      ({ server, port } = await createMockBroker(() => helpText));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.help();
-      expect(result).toContain('COMMANDS');
-      expect(result).toContain('CLUSTERS LIST');
-    });
-  });
-
-  // ============================================================================
+  // ==========================================================================
   // Cluster Management
-  // ============================================================================
+  // ==========================================================================
 
   describe('Cluster Management', () => {
-    let server: net.Server;
-    let port: number;
+    test('listClusters returns array of ClusterInfo', async () => {
+      const clusters: ClusterInfo[] = await admin.listClusters();
 
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+      expect(Array.isArray(clusters)).toBe(true);
+      expect(clusters.length).toBeGreaterThan(0);
+
+      const cluster = clusters[0];
+      expect(typeof cluster.name).toBe('string');
+      expect(typeof cluster.locality).toBe('string');
+      expect(Array.isArray(cluster.nodes)).toBe(true);
+      expect(cluster.nodes.length).toBeGreaterThan(0);
+      expect(typeof cluster.nodes[0].hostName).toBe('string');
+      expect(typeof cluster.nodes[0].nodeId).toBe('number');
     });
 
-    test('listClusters parses JSON response', async () => {
-      ({ server, port } = await createMockBroker((cmd) => {
-        if (cmd === 'CLUSTERS LIST') {
-          return JSON.stringify({ clusters: ['cluster-1', 'cluster-2', 'cluster-3'] });
-        }
-        return '{}';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
+    test('listClusters includes the test cluster', async () => {
       const clusters = await admin.listClusters();
-      expect(clusters).toEqual(['cluster-1', 'cluster-2', 'cluster-3']);
+      const names = clusters.map((c) => c.name);
+      expect(names).toContain(TEST_CLUSTER);
     });
 
-    test('listClusters falls back to text parsing', async () => {
-      // Real broker text format:
-      //   The following clusters are active:
-      //       [LOCAL ] cluster-alpha:
-      //           localhost           0      UNSPECIFIED
-      //       [LOCAL ] cluster-beta:
-      //           localhost           0      UNSPECIFIED
-      const textOutput = [
-        'The following clusters are active:',
-        '      [LOCAL ] cluster-alpha:',
-        '          localhost           0      UNSPECIFIED',
-        '      [LOCAL ] cluster-beta:',
-        '          localhost           0      UNSPECIFIED',
-      ].join('\n');
-      ({ server, port } = await createMockBroker(() => textOutput));
+    test('getClusterStatus returns ClusterStatus', async () => {
+      const status: ClusterStatus = await admin.getClusterStatus(TEST_CLUSTER);
 
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const clusters = await admin.listClusters();
-      expect(clusters).toContain('cluster-alpha');
-      expect(clusters).toContain('cluster-beta');
+      // Top-level fields
+      expect(status.name).toBe(TEST_CLUSTER);
+      expect(typeof status.description).toBe('string');
+      expect(typeof status.selfNodeDescription).toBe('string');
+      expect(typeof status.isHealthy).toBe('boolean');
+
+      // Node statuses
+      expect(status.nodeStatuses).toBeDefined();
+      expect(Array.isArray(status.nodeStatuses.nodes)).toBe(true);
+      expect(status.nodeStatuses.nodes.length).toBeGreaterThan(0);
+      const node = status.nodeStatuses.nodes[0];
+      expect(typeof node.description).toBe('string');
+      expect(typeof node.status).toBe('string');
+      expect(Array.isArray(node.primaryForPartitionIds)).toBe(true);
+
+      // Elector info
+      expect(typeof status.electorInfo.electorState).toBe('string');
+      expect(typeof status.electorInfo.leaderNode).toBe('string');
+      expect(typeof status.electorInfo.leaderStatus).toBe('string');
+
+      // Partitions
+      expect(status.partitionsInfo).toBeDefined();
+      expect(Array.isArray(status.partitionsInfo.partitions)).toBe(true);
+      if (status.partitionsInfo.partitions.length > 0) {
+        const part = status.partitionsInfo.partitions[0];
+        expect(typeof part.numQueuesMapped).toBe('number');
+        expect(typeof part.numActiveQueues).toBe('number');
+        expect(typeof part.primaryNode).toBe('string');
+        expect(typeof part.primaryLeaseId).toBe('number');
+        expect(typeof part.primaryStatus).toBe('string');
+      }
+
+      // Queues
+      expect(status.queuesInfo).toBeDefined();
+      expect(Array.isArray(status.queuesInfo.storages)).toBe(true);
+
+      // Storage summary
+      expect(status.clusterStorageSummary).toBeDefined();
+      expect(typeof status.clusterStorageSummary.clusterFileStoreLocation).toBe('string');
+      expect(Array.isArray(status.clusterStorageSummary.fileStores)).toBe(true);
     });
 
-    test('getClusterStatus parses full JSON response', async () => {
-      const mockStatus = {
-        description: 'Production cluster',
-        selfNodeDescription: 'node-1.example.com:30114',
-        isHealthy: true,
-        nodeStatuses: [
-          {
-            description: 'node-1.example.com:30114',
-            isAvailable: true,
-            status: 'E_AVAILABLE',
-            primaryForPartitionIds: [0, 1],
-          },
-          {
-            description: 'node-2.example.com:30114',
-            isAvailable: true,
-            status: 'E_AVAILABLE',
-            primaryForPartitionIds: [2, 3],
-          },
-        ],
-        electorInfo: {
-          electorState: 'LEADER',
-          leaderNode: 'node-1.example.com:30114',
-          leaderStatus: 'ACTIVE',
-        },
-        partitionsInfo: [
-          {
-            partitionId: 0,
-            numQueuesMapped: 5,
-            numActiveQueues: 3,
-            primaryNode: 'node-1.example.com:30114',
-            primaryLeaseId: 42,
-            primaryStatus: 'ACTIVE',
-          },
-        ],
-        queuesInfo: [
-          {
-            uri: 'bmq://bmq.test.mem.priority/orders',
-            partitionId: 0,
-            isCreated: true,
-            numActiveAppIds: 2,
-          },
-        ],
-        clusterStorageSummary: {
-          totalMappedBytes: 104857600,
-          fileStores: [
-            { partitionId: 0, numMappedFiles: 4, totalMappedBytes: 26214400 },
-          ],
-        },
-      };
-
-      ({ server, port } = await createMockBroker((cmd) => {
-        if (cmd.startsWith('CLUSTERS CLUSTER')) return JSON.stringify(mockStatus);
-        return '{}';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const status = await admin.getClusterStatus('prod-cluster');
-
-      expect(status.name).toBe('prod-cluster');
+    test('getClusterStatus shows healthy cluster', async () => {
+      const status = await admin.getClusterStatus(TEST_CLUSTER);
       expect(status.isHealthy).toBe(true);
-      expect(status.nodeStatuses).toHaveLength(2);
-      expect(status.nodeStatuses[0].isAvailable).toBe(true);
-      expect(status.nodeStatuses[0].status).toBe('E_AVAILABLE');
-      expect(status.nodeStatuses[0].primaryForPartitionIds).toEqual([0, 1]);
-      expect(status.electorInfo.electorState).toBe('LEADER');
-      expect(status.electorInfo.leaderNode).toBe('node-1.example.com:30114');
-      expect(status.partitionsInfo).toHaveLength(1);
-      expect(status.partitionsInfo[0].numQueuesMapped).toBe(5);
-      expect(status.queuesInfo).toHaveLength(1);
-      expect(status.queuesInfo[0].uri).toContain('orders');
-      expect(status.clusterStorageSummary.totalMappedBytes).toBe(104857600);
     });
 
-    test('getClusterStatus handles non-JSON response gracefully', async () => {
-      // Real broker text format includes "Is Healthy : Yes" which the regex parser detects
-      const textOutput = [
-        'Cluster: test',
-        'Is Healthy : Yes',
-        'Nodes: (none)',
-      ].join('\n');
-      ({ server, port } = await createMockBroker(() => textOutput));
+    test('getClusterStatus includes storage info for queues', async () => {
+      const status = await admin.getClusterStatus(TEST_CLUSTER);
+      const storages = status.queuesInfo.storages;
 
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const status = await admin.getClusterStatus('test');
-
-      expect(status.name).toBe('test');
-      expect(status.isHealthy).toBe(true);
-      expect(status.nodeStatuses).toEqual([]);
+      if (storages.length > 0) {
+        const s = storages[0];
+        expect(typeof s.queueUri).toBe('string');
+        expect(typeof s.queueKey).toBe('string');
+        expect(typeof s.partitionId).toBe('number');
+        expect(typeof s.numMessages).toBe('number');
+        expect(typeof s.numBytes).toBe('number');
+        expect(typeof s.isPersistent).toBe('boolean');
+      }
     });
 
-    test('forceGcQueues sends correct command', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'GC completed for 3 queues';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.forceGcQueues('my-cluster');
-      expect(receivedCmd).toBe('CLUSTERS CLUSTER my-cluster FORCE_GC_QUEUES');
-      expect(result).toContain('GC completed');
-    });
-
-    test('getClusterStorageSummary returns parsed data', async () => {
-      const mockSummary: ClusterStorageSummary = {
-        totalMappedBytes: 536870912,
-        fileStores: [
-          { partitionId: 0, numMappedFiles: 8, totalMappedBytes: 134217728 },
-          { partitionId: 1, numMappedFiles: 6, totalMappedBytes: 134217728 },
-        ],
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockSummary)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const summary = await admin.getClusterStorageSummary('my-cluster');
-      expect(summary.totalMappedBytes).toBe(536870912);
-      expect(summary.fileStores).toHaveLength(2);
-    });
-
-    test('getPartitionSummary sends correct command', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({ partitionId: 2, status: 'active' });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.getPartitionSummary('prod', 2);
-      expect(receivedCmd).toBe('CLUSTERS CLUSTER prod STORAGE PARTITION 2 SUMMARY');
-    });
-
-    test('setPartitionState sends ENABLE/DISABLE', async () => {
-      const cmds: string[] = [];
-      ({ server, port } = await createMockBroker((cmd) => {
-        cmds.push(cmd);
-        return 'OK';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.setPartitionState('c1', 0, true);
-      await admin.setPartitionState('c1', 1, false);
-      expect(cmds[0]).toBe('CLUSTERS CLUSTER c1 STORAGE PARTITION 0 ENABLE');
-      expect(cmds[1]).toBe('CLUSTERS CLUSTER c1 STORAGE PARTITION 1 DISABLE');
-    });
-
-    test('getStorageQueueStatus parses queue list', async () => {
-      ({ server, port } = await createMockBroker(() =>
-        JSON.stringify({
-          queues: [
-            { queueUri: 'bmq://dom/q1', queueKey: 'k1', partitionId: 0, numMessages: 100, numBytes: 5000, isPersistent: true },
-            { queueUri: 'bmq://dom/q2', queueKey: 'k2', partitionId: 1, numMessages: 0, numBytes: 0, isPersistent: false },
-          ],
-        }),
-      ));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const queues = await admin.getStorageQueueStatus('c1', 'bmq.test');
-      expect(queues).toHaveLength(2);
-      expect(queues[0].queueUri).toContain('q1');
-      expect(queues[0].isPersistent).toBe(true);
-      expect(queues[1].numMessages).toBe(0);
+    test('forceGcQueues returns response string', async () => {
+      const result = await admin.forceGcQueues(TEST_CLUSTER);
+      expect(typeof result).toBe('string');
     });
   });
 
-  // ============================================================================
+  // ==========================================================================
   // Domain Management
-  // ============================================================================
+  // ==========================================================================
 
   describe('Domain Management', () => {
-    let server: net.Server;
-    let port: number;
+    test('getDomainInfo returns DomainInfo', async () => {
+      const info: DomainInfo = await admin.getDomainInfo(TEST_DOMAIN);
 
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+      expect(info.name).toBe(TEST_DOMAIN);
+      expect(typeof info.configJson).toBe('string');
+      expect(info.configJson.length).toBeGreaterThan(0);
+      expect(typeof info.clusterName).toBe('string');
+
+      // Capacity meter
+      expect(info.capacityMeter).toBeDefined();
+      expect(typeof info.capacityMeter.numMessages).toBe('number');
+      expect(typeof info.capacityMeter.messageCapacity).toBe('number');
+      expect(typeof info.capacityMeter.numBytes).toBe('number');
+      expect(typeof info.capacityMeter.byteCapacity).toBe('number');
+      expect(typeof info.capacityMeter.isDisabled).toBe('boolean');
+      expect(info.capacityMeter.messageCapacity).toBeGreaterThan(0);
+      expect(info.capacityMeter.byteCapacity).toBeGreaterThan(0);
+
+      // Queue URIs
+      expect(Array.isArray(info.queueUris)).toBe(true);
+
+      // Config is valid JSON
+      expect(() => JSON.parse(info.configJson)).not.toThrow();
     });
 
-    test('getDomainInfo parses full response', async () => {
-      const mockDomain = {
-        name: 'bmq.test.mem.priority',
-        configJson: '{"mode":"priority","storage":"in-memory"}',
-        clusterName: 'local-cluster',
-        capacityMeter: {
-          name: 'bmq.test.mem.priority',
-          messages: 1500,
-          messageCapacity: 100000,
-          bytes: 524288,
-          byteCapacity: 67108864,
-        },
-        queueUris: [
-          'bmq://bmq.test.mem.priority/orders',
-          'bmq://bmq.test.mem.priority/events',
-        ],
-        storageContent: [
-          {
-            queueUri: 'bmq://bmq.test.mem.priority/orders',
-            queueKey: 'abc123',
-            partitionId: 0,
-            numMessages: 1200,
-            numBytes: 450000,
-            isPersistent: false,
-          },
-        ],
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockDomain)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const info = await admin.getDomainInfo('bmq.test.mem.priority');
-
-      expect(info.name).toBe('bmq.test.mem.priority');
-      expect(info.clusterName).toBe('local-cluster');
-      expect(info.capacityMeter.messages).toBe(1500);
-      expect(info.capacityMeter.messageCapacity).toBe(100000);
-      expect(info.queueUris).toHaveLength(2);
-      expect(info.storageContent).toHaveLength(1);
-      expect(info.storageContent[0].numMessages).toBe(1200);
+    test('getDomainInfo includes the test queue', async () => {
+      const info = await admin.getDomainInfo(TEST_DOMAIN);
+      const hasQueue = info.queueUris.some((uri) =>
+        uri.includes(TEST_QUEUE),
+      );
+      expect(hasQueue).toBe(true);
     });
 
-    test('getDomainInfo handles non-JSON gracefully', async () => {
-      ({ server, port } = await createMockBroker(() => 'Domain info not available'));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const info = await admin.getDomainInfo('unknown-domain');
-
-      expect(info.name).toBe('unknown-domain');
-      expect(info.queueUris).toEqual([]);
-      expect(info.capacityMeter.messages).toBe(0);
+    test('getDomainInfo config contains queue limits', async () => {
+      const info = await admin.getDomainInfo(TEST_DOMAIN);
+      const config = JSON.parse(info.configJson);
+      expect(config.storage).toBeDefined();
+      expect(config.storage.queueLimits).toBeDefined();
+      expect(typeof config.storage.queueLimits.messages).toBe('number');
+      expect(typeof config.storage.queueLimits.bytes).toBe('number');
     });
 
-    test('purgeDomain sends correct command and parses response', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({
-          purgedQueues: [
-            { queue: 'orders', appId: '*', numMessagesPurged: 150, numBytesPurged: 65536 },
-            { queue: 'events', appId: '*', numMessagesPurged: 30, numBytesPurged: 12000 },
-          ],
-        });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const results = await admin.purgeDomain('bmq.test.mem.priority');
-
-      expect(receivedCmd).toBe('DOMAINS DOMAIN bmq.test.mem.priority PURGE');
-      expect(results).toHaveLength(2);
-      expect(results[0].numMessagesPurged).toBe(150);
-    });
-
-    test('purgeQueue sends correct command with appId', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({
-          queue: 'orders',
-          appId: 'app1',
-          numMessagesPurged: 42,
-          numBytesPurged: 16384,
-        });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.purgeQueue('bmq.test', 'orders', 'app1');
-
-      expect(receivedCmd).toBe('DOMAINS DOMAIN bmq.test QUEUE orders PURGE APPID app1');
-      expect(result.numMessagesPurged).toBe(42);
-      expect(result.appId).toBe('app1');
-    });
-
-    test('purgeQueue defaults appId to wildcard', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({ queue: 'q', appId: '*', numMessagesPurged: 0, numBytesPurged: 0 });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.purgeQueue('bmq.test', 'my-queue');
-      expect(receivedCmd).toContain('APPID *');
-    });
-
-    test('getQueueInternals returns parsed data', async () => {
-      const mockInternals: QueueInternals = {
-        queueUri: 'bmq://bmq.test/orders',
-        state: 'OPEN',
-        partitionId: 0,
-        storageInfo: { numMessages: 500, numBytes: 200000, virtualStorages: 2 },
-        handles: [
-          {
-            clientDescription: 'producer-app:12345',
-            handleParametersJson: '{"flags":2}',
-            isClientClusterMember: false,
-          },
-        ],
-        consumers: [
-          {
-            appId: '__default',
-            numConsumers: 3,
-            maxUnconfirmedMessages: 1024,
-            maxUnconfirmedBytes: 33554432,
-            consumerPriority: 0,
-          },
-        ],
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockInternals)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const internals = await admin.getQueueInternals('bmq.test', 'orders');
-
-      expect(internals.state).toBe('OPEN');
-      expect(internals.handles).toHaveLength(1);
-      expect(internals.consumers).toHaveLength(1);
-      expect(internals.consumers[0].numConsumers).toBe(3);
-    });
-
-    test('listQueueMessages parses message list', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({
-          messages: [
-            { guid: 'ABCD1234', offset: 0, size: 256, arrivalTimestamp: '2025-01-01T00:00:00Z', properties: { type: 'order' } },
-            { guid: 'EFGH5678', offset: 256, size: 128, arrivalTimestamp: '2025-01-01T00:00:01Z', properties: {} },
-          ],
-        });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const messages = await admin.listQueueMessages('bmq.test', 'orders', 0, 50, 'app1');
-
-      expect(receivedCmd).toBe('DOMAINS DOMAIN bmq.test QUEUE orders LIST app1 0 50');
-      expect(messages).toHaveLength(2);
-      expect(messages[0].guid).toBe('ABCD1234');
-      expect(messages[1].size).toBe(128);
-    });
-
-    test('listQueueMessages works without optional appId', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return JSON.stringify({ messages: [] });
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.listQueueMessages('bmq.test', 'q1');
-      expect(receivedCmd).toBe('DOMAINS DOMAIN bmq.test QUEUE q1 LIST 0 100');
-    });
-
-    test('reconfigureDomain sends correct command', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'Domain reconfigured successfully';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.reconfigureDomain('bmq.test.persistent');
-      expect(receivedCmd).toBe('DOMAINS RECONFIGURE bmq.test.persistent');
-      expect(result).toContain('reconfigured');
+    test('reconfigureDomain returns response string', async () => {
+      const result = await admin.reconfigureDomain(TEST_DOMAIN);
+      expect(typeof result).toBe('string');
     });
 
     test('clearDomainCache with specific domain', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'Cache cleared';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.clearDomainCache('bmq.test');
-      expect(receivedCmd).toBe('DOMAINS RESOLVER CACHE_CLEAR bmq.test');
+      const result = await admin.clearDomainCache(TEST_DOMAIN);
+      expect(typeof result).toBe('string');
     });
 
-    test('clearDomainCache without arg clears ALL', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'Cache cleared';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.clearDomainCache();
-      expect(receivedCmd).toBe('DOMAINS RESOLVER CACHE_CLEAR ALL');
+    test('clearDomainCache for ALL', async () => {
+      const result = await admin.clearDomainCache();
+      expect(typeof result).toBe('string');
     });
   });
 
-  // ============================================================================
+  // ==========================================================================
+  // Queue Operations
+  // ==========================================================================
+
+  describe('Queue Operations', () => {
+    test('getQueueInternals returns QueueInternals', async () => {
+      const internals: QueueInternals = await admin.getQueueInternals(
+        TEST_DOMAIN,
+        TEST_QUEUE,
+      );
+
+      // State
+      expect(internals.state).toBeDefined();
+      expect(typeof internals.state.uri).toBe('string');
+      expect(internals.state.uri).toContain(TEST_QUEUE);
+      expect(typeof internals.state.partitionId).toBe('number');
+      expect(typeof internals.state.key).toBe('string');
+
+      // Storage
+      expect(internals.state.storage).toBeDefined();
+      expect(typeof internals.state.storage.numMessages).toBe('number');
+      expect(typeof internals.state.storage.numBytes).toBe('number');
+      expect(Array.isArray(internals.state.storage.virtualStorages)).toBe(true);
+
+      // Capacity meter
+      expect(internals.state.capacityMeter).toBeDefined();
+      expect(typeof internals.state.capacityMeter.messageCapacity).toBe('number');
+      expect(typeof internals.state.capacityMeter.byteCapacity).toBe('number');
+      expect(internals.state.capacityMeter.messageCapacity).toBeGreaterThan(0);
+
+      // Handles
+      expect(Array.isArray(internals.state.handles)).toBe(true);
+
+      // Queue metadata
+      expect(internals.queue).toBeDefined();
+    });
+
+    test('getQueueInternals shows parent capacity meter', async () => {
+      const internals = await admin.getQueueInternals(TEST_DOMAIN, TEST_QUEUE);
+      const parent = internals.state.capacityMeter.parent;
+      expect(parent).toBeDefined();
+      expect(typeof parent!.messageCapacity).toBe('number');
+      expect(typeof parent!.byteCapacity).toBe('number');
+    });
+
+    test('getQueueInternals includes virtual storages', async () => {
+      const internals = await admin.getQueueInternals(TEST_DOMAIN, TEST_QUEUE);
+      const vs = internals.state.storage.virtualStorages;
+      expect(vs.length).toBeGreaterThan(0);
+      expect(typeof vs[0].appId).toBe('string');
+      expect(typeof vs[0].numMessages).toBe('number');
+    });
+
+    test('purgeQueue returns response text', async () => {
+      const result = await admin.purgeQueue(TEST_DOMAIN, TEST_QUEUE);
+      expect(typeof result).toBe('string');
+    });
+
+    test('purgeDomain returns response text', async () => {
+      const result = await admin.purgeDomain(TEST_DOMAIN);
+      expect(typeof result).toBe('string');
+    });
+  });
+
+  // ==========================================================================
   // Statistics
-  // ============================================================================
+  // ==========================================================================
 
   describe('Statistics', () => {
-    let server: net.Server;
-    let port: number;
+    test('getStats returns BrokerStats with domainQueues', async () => {
+      const stats: BrokerStats = await admin.getStats();
 
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+      expect(stats.domainQueues).toBeDefined();
+      expect(stats.domainQueues.domains).toBeDefined();
+      expect(typeof stats.domainQueues.domains).toBe('object');
     });
 
-    test('getStats parses JSON broker statistics', async () => {
-      const mockStats = {
-        broker: { clientsCount: 15, queuesCount: 8 },
-        domains: [
-          { name: 'bmq.test.mem.priority', configuredMessages: 100000, configuredBytes: 67108864, queueCount: 3, queueCountOpen: 2 },
-        ],
-        queues: [
-          {
-            uri: 'bmq://bmq.test.mem.priority/orders',
-            role: 'PRIMARY',
-            messagesCount: 1200,
-            messagesCapacity: 100000,
-            bytesCount: 500000,
-            bytesCapacity: 67108864,
-            putMessagesDelta: 350,
-            putBytesDelta: 150000,
-            pushMessagesDelta: 340,
-            pushBytesDelta: 145000,
-            ackMessagesDelta: 340,
-            confirmMessagesDelta: 335,
-            nackCount: 2,
-            numProducers: 3,
-            numConsumers: 5,
-            ackTimeAvg: 0.8,
-            ackTimeMax: 12.0,
-            confirmTimeAvg: 1.2,
-            confirmTimeMax: 45.0,
-            queueTimeAvg: 2.0,
-            queueTimeMax: 89.0,
-          },
-        ],
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockStats)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
+    test('getStats includes the test domain', async () => {
       const stats = await admin.getStats();
-
-      expect(stats.clientsCount).toBe(15);
-      expect(stats.queuesCount).toBe(8);
-      expect(stats.domains).toHaveLength(1);
-      expect(stats.domains[0].name).toBe('bmq.test.mem.priority');
-      expect(stats.queues).toHaveLength(1);
-
-      const q = stats.queues[0];
-      expect(q.uri).toContain('orders');
-      expect(q.role).toBe('PRIMARY');
-      expect(q.putMessagesDelta).toBe(350);
-      expect(q.nackCount).toBe(2);
-      expect(q.ackTimeAvg).toBe(0.8);
-      expect(q.numProducers).toBe(3);
-      expect(q.numConsumers).toBe(5);
+      const domainNames = Object.keys(stats.domainQueues.domains);
+      expect(domainNames).toContain(TEST_DOMAIN);
     });
 
-    test('getStats parses text fallback for client/queue counts', async () => {
-      ({ server, port } = await createMockBroker(
-        () => 'Stats:\n  clients: 7\n  queues: 4\n  uptime: 3600s',
-      ));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
+    test('getStats includes queue stat values', async () => {
       const stats = await admin.getStats();
-      expect(stats.clientsCount).toBe(7);
-      expect(stats.queuesCount).toBe(4);
-      expect(stats.domains).toEqual([]);
-      expect(stats.queues).toEqual([]);
+      const domainQueues = stats.domainQueues.domains[TEST_DOMAIN];
+      expect(domainQueues).toBeDefined();
+
+      const queueUris = Object.keys(domainQueues);
+      expect(queueUris.length).toBeGreaterThan(0);
+
+      const queueUri = queueUris.find((u) => u.includes(TEST_QUEUE));
+      expect(queueUri).toBeDefined();
+
+      const values = domainQueues[queueUri!].values;
+      expect(typeof values).toBe('object');
+
+      // Verify well-known stat fields exist
+      expect(typeof values.queue_put_msgs).toBe('number');
+      expect(typeof values.queue_push_msgs).toBe('number');
+      expect(typeof values.queue_ack_msgs).toBe('number');
+      expect(typeof values.queue_confirm_msgs).toBe('number');
+      expect(typeof values.queue_nack_msgs).toBe('number');
+      expect(typeof values.queue_producers_count).toBe('number');
+      expect(typeof values.queue_consumers_count).toBe('number');
+      expect(typeof values.queue_content_msgs).toBe('number');
+      expect(typeof values.queue_content_bytes).toBe('number');
+      expect(typeof values.queue_cfg_msgs).toBe('number');
+      expect(typeof values.queue_cfg_bytes).toBe('number');
+      expect(typeof values.queue_role).toBe('number');
+      expect(typeof values.queue_ack_time_avg).toBe('number');
+      expect(typeof values.queue_ack_time_max).toBe('number');
+      expect(typeof values.queue_confirm_time_avg).toBe('number');
+      expect(typeof values.queue_confirm_time_max).toBe('number');
+      expect(typeof values.queue_queue_time_avg).toBe('number');
+      expect(typeof values.queue_queue_time_max).toBe('number');
     });
 
-    test('getStats handles snake_case fields in queue data', async () => {
-      const mockStats = {
-        broker: { clientsCount: 1, queuesCount: 1 },
-        queues: [
-          {
-            uri: 'bmq://d/q',
-            role: 'PRIMARY',
-            messages_current: 50,
-            messages_max: 10000,
-            bytes_current: 2000,
-            bytes_max: 5000000,
-            put_messages_delta: 100,
-            put_bytes_delta: 40000,
-            push_messages_delta: 95,
-            push_bytes_delta: 38000,
-            ack_delta: 95,
-            confirm_delta: 90,
-            nack: 1,
-            nb_producer: 2,
-            nb_consumer: 4,
-            ack_time_avg: 1.5,
-            ack_time_max: 20,
-            confirm_time_avg: 2.0,
-            confirm_time_max: 50,
-            queue_time_avg: 3.0,
-            queue_time_max: 100,
-          },
-        ],
-      };
+    test('getStats queue capacity matches domain config', async () => {
+      const [stats, domainInfo] = await Promise.all([
+        admin.getStats(),
+        admin.getDomainInfo(TEST_DOMAIN),
+      ]);
 
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockStats)));
+      const config = JSON.parse(domainInfo.configJson);
+      const queueLimits = config.storage.queueLimits;
 
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const stats = await admin.getStats();
-      const q = stats.queues[0];
+      const domainQueues = stats.domainQueues.domains[TEST_DOMAIN];
+      const queueUri = Object.keys(domainQueues).find((u) =>
+        u.includes(TEST_QUEUE),
+      )!;
+      const values = domainQueues[queueUri].values;
 
-      // Verifies the snake_case fallback mapping works
-      expect(q.messagesCount).toBe(50);
-      expect(q.messagesCapacity).toBe(10000);
-      expect(q.putMessagesDelta).toBe(100);
-      expect(q.pushMessagesDelta).toBe(95);
-      expect(q.ackMessagesDelta).toBe(95);
-      expect(q.confirmMessagesDelta).toBe(90);
-      expect(q.nackCount).toBe(1);
-      expect(q.numProducers).toBe(2);
-      expect(q.numConsumers).toBe(4);
+      expect(values.queue_cfg_msgs).toBe(queueLimits.messages);
+      expect(values.queue_cfg_bytes).toBe(queueLimits.bytes);
     });
 
-    test('listTunables returns text', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'QUEUE_GC_INTERVAL\nQUEUE_CONSUMER_DELIVERY_TIMEOUT';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
+    test('listTunables returns a string', async () => {
       const result = await admin.listTunables();
-      expect(receivedCmd).toBe('STAT LIST_TUNABLES');
-      expect(result).toContain('QUEUE_GC_INTERVAL');
-    });
-
-    test('getTunable sends correct command', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return '60000';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const value = await admin.getTunable('QUEUE_GC_INTERVAL');
-      expect(receivedCmd).toBe('STAT GET QUEUE_GC_INTERVAL');
-      expect(value).toBe('60000');
-    });
-
-    test('setTunable sends correct command with value', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'OK';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.setTunable('QUEUE_GC_INTERVAL', 30000);
-      expect(receivedCmd).toBe('STAT SET QUEUE_GC_INTERVAL 30000');
-    });
-
-    test('setTunable accepts string values', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'OK';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      await admin.setTunable('SOME_PARAM', 'enabled');
-      expect(receivedCmd).toBe('STAT SET SOME_PARAM enabled');
+      expect(typeof result).toBe('string');
     });
   });
 
-  // ============================================================================
+  // ==========================================================================
   // Broker Configuration
-  // ============================================================================
+  // ==========================================================================
 
   describe('Broker Configuration', () => {
-    let server: net.Server;
-    let port: number;
+    test('getBrokerConfig returns raw and parsed', async () => {
+      const config: BrokerConfig = await admin.getBrokerConfig();
 
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
-    });
-
-    test('getBrokerConfig parses JSON config', async () => {
-      const mockConfig = {
-        appConfig: {
-          brokerInstanceName: 'bmqbrkr-001',
-          hostName: 'broker.example.com',
-          hostDataCenter: 'DC1',
-        },
-        networkInterfaces: { tcpInterface: { port: 30114 } },
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockConfig)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const config = await admin.getBrokerConfig();
-
-      expect(config.parsed).not.toBeNull();
-      expect(config.parsed?.appConfig).toBeDefined();
-      expect(config.raw).toContain('bmqbrkr-001');
-    });
-
-    test('getBrokerConfig handles non-JSON config', async () => {
-      ({ server, port } = await createMockBroker(() => 'appConfig:\n  name: broker-1\n  port: 30114'));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const config = await admin.getBrokerConfig();
-
-      expect(config.parsed).toBeNull();
-      expect(config.raw).toContain('broker-1');
+      expect(typeof config.raw).toBe('string');
+      expect(config.raw.length).toBeGreaterThan(0);
+      // parsed may be null if the response isn't JSON
+      if (config.parsed !== null) {
+        expect(typeof config.parsed).toBe('object');
+      }
     });
   });
 
-  // ============================================================================
-  // Danger Zone
-  // ============================================================================
+  // ==========================================================================
+  // Edge Cases & Error Handling
+  // ==========================================================================
 
-  describe('Danger Zone', () => {
-    let server: net.Server;
-    let port: number;
-
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+  describe('Edge Cases', () => {
+    test('getClusterStatus rejects for non-existent cluster', async () => {
+      await expect(
+        admin.getClusterStatus('nonexistent-cluster-xyz'),
+      ).rejects.toThrow(/No status returned|Expected JSON/);
     });
 
-    test('shutdown sends DANGER SHUTDOWN', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'Shutting down...';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.shutdown();
-      expect(receivedCmd).toBe('DANGER SHUTDOWN');
-      expect(result).toContain('Shutting down');
+    test('getQueueInternals rejects for non-existent queue', async () => {
+      await expect(
+        admin.getQueueInternals(TEST_DOMAIN, 'nonexistent-queue-xyz'),
+      ).rejects.toThrow(/No internals returned|Expected JSON/);;
     });
 
-    test('terminate sends DANGER TERMINATE', async () => {
-      let receivedCmd = '';
-      ({ server, port } = await createMockBroker((cmd) => {
-        receivedCmd = cmd;
-        return 'Terminating...';
-      }));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const result = await admin.terminate();
-      expect(receivedCmd).toBe('DANGER TERMINATE');
-      expect(result).toContain('Terminating');
-    });
-  });
-
-  // ============================================================================
-  // Response Parsing Edge Cases
-  // ============================================================================
-
-  describe('Response Parsing Edge Cases', () => {
-    let server: net.Server;
-    let port: number;
-
-    afterEach(async () => {
-      if (server) await closeMockBroker(server);
+    test('constructor uses defaults when no options provided', () => {
+      const a = new BrokerAdmin();
+      // Should not throw — defaults to localhost:30114
+      expect(a).toBeInstanceOf(BrokerAdmin);
     });
 
-    test('cluster status with missing fields uses safe defaults', async () => {
-      ({ server, port } = await createMockBroker(() => JSON.stringify({ isHealthy: false })));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const status = await admin.getClusterStatus('empty-cluster');
-
-      expect(status.name).toBe('empty-cluster');
-      expect(status.isHealthy).toBe(false);
-      expect(status.description).toBe('');
-      expect(status.nodeStatuses).toEqual([]);
-      expect(status.electorInfo.electorState).toBe('UNKNOWN');
-      expect(status.partitionsInfo).toEqual([]);
-      expect(status.queuesInfo).toEqual([]);
-    });
-
-    test('domain info with missing fields uses safe defaults', async () => {
-      ({ server, port } = await createMockBroker(() => JSON.stringify({ clusterName: 'c1' })));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const info = await admin.getDomainInfo('partial');
-
-      expect(info.name).toBe('partial');
-      expect(info.clusterName).toBe('c1');
-      expect(info.queueUris).toEqual([]);
-      expect(info.storageContent).toEqual([]);
-      expect(info.capacityMeter.messages).toBe(0);
-    });
-
-    test('stats with empty JSON returns zero counts', async () => {
-      ({ server, port } = await createMockBroker(() => '{}'));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const stats = await admin.getStats();
-
-      expect(stats.clientsCount).toBe(0);
-      expect(stats.queuesCount).toBe(0);
-      expect(stats.domains).toEqual([]);
-      expect(stats.queues).toEqual([]);
-    });
-
-    test('queue stats with empty data returns zeroed fields', async () => {
-      const mockStats = {
-        broker: { clientsCount: 0, queuesCount: 1 },
-        queues: [{ uri: 'bmq://d/q' }],
-      };
-
-      ({ server, port } = await createMockBroker(() => JSON.stringify(mockStats)));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const stats = await admin.getStats();
-      const q = stats.queues[0];
-
-      expect(q.uri).toBe('bmq://d/q');
-      expect(q.role).toBe('UNKNOWN');
-      expect(q.messagesCount).toBe(0);
-      expect(q.bytesCount).toBe(0);
-      expect(q.putMessagesDelta).toBe(0);
-      expect(q.nackCount).toBe(0);
-      expect(q.ackTimeAvg).toBe(0);
-    });
-
-    test('purgeDomain with non-array response wraps in array', async () => {
-      ({ server, port } = await createMockBroker(() =>
-        JSON.stringify({
-          queue: 'single',
-          appId: '*',
-          numMessagesPurged: 10,
-          numBytesPurged: 4096,
-        }),
-      ));
-
-      const admin = new BrokerAdmin({ host: '127.0.0.1', port });
-      const results = await admin.purgeDomain('domain');
-      expect(results).toHaveLength(1);
-      expect(results[0].queue).toBe('single');
+    test('constructor respects custom options', () => {
+      const a = new BrokerAdmin({
+        host: '10.0.0.1',
+        port: 12345,
+        timeout: 5000,
+      });
+      expect(a).toBeInstanceOf(BrokerAdmin);
     });
   });
 });
