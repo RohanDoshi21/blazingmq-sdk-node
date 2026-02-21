@@ -121,8 +121,11 @@ export class BmqConnection extends EventEmitter {
         this.onData(data);
       });
 
+      let connectError: Error | null = null;
+
       socket.on('error', (err: Error) => {
         clearTimeout(connectTimeout);
+        connectError = err;
         this.emit('error', err);
       });
 
@@ -132,6 +135,13 @@ export class BmqConnection extends EventEmitter {
         this.socket = null;
         this.readBuffer = Buffer.alloc(0);
         this.emit('disconnected');
+
+        // If we were still connecting when the socket closed, reject the
+        // connect promise so callers aren't left hanging.
+        if (!wasConnected && connectError) {
+          reject(connectError);
+          return;
+        }
 
         if (wasConnected && !this.intentionalDisconnect && this.options.reconnect) {
           this.scheduleReconnect();

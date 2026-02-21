@@ -10,12 +10,27 @@
 //   - Storage management (summaries, partition control)
 //   - Broker configuration inspection
 //
-// This module communicates with the broker's admin port via TCP,
-// sending text commands and receiving JSON or text responses.
+// This module communicates with the broker over the BMQ binary protocol,
+// performing a full negotiation handshake before sending AdminCommand
+// control messages and receiving AdminCommandResponse payloads.
 // ============================================================================
 
-import * as net from 'net';
+import * as os from 'os';
 import { EventEmitter } from 'events';
+import { BmqConnection } from './transport/connection';
+import {
+  buildControlEvent,
+  parseControlPayload,
+  buildHeartbeatResponse,
+} from './protocol/codec';
+import {
+  EventType,
+  PROTOCOL_VERSION,
+  SDK_VERSION,
+  SDK_NAME,
+  SDK_VERSION_STRING,
+  SDK_FEATURES,
+} from './protocol/constants';
 
 // ============================================================================
 // Types
@@ -251,55 +266,125 @@ export class BrokerAdmin extends EventEmitter {
 
   /**
    * Send a raw admin command to the broker and return the response.
-   * Opens a new TCP connection for each command.
+   *
+   * For each command a new TCP connection is opened, the BMQ protocol
+   * negotiation is performed, an AdminCommand control message is sent,
+   * and the AdminCommandResponse is awaited before disconnecting.
    */
   async sendCommand(command: string): Promise<string> {
+    const conn = new BmqConnection({
+      host: this.options.host,
+      port: this.options.port,
+      connectTimeout: this.options.timeout,
+      reconnect: false,
+    });
+
+    // Prevent Node.js from throwing on the EventEmitter 'error' event.
+    // Connection errors are surfaced via the rejected connect() promise.
+    conn.on('error', () => {});
+
+    try {
+      // 1. Connect
+      await conn.connect();
+
+      // 2. Negotiate — send ClientIdentity as TCPADMIN, await BrokerResponse
+      const clientIdentity = {
+        clientIdentity: {
+          protocolVersion: PROTOCOL_VERSION,
+          sdkVersion: SDK_VERSION,
+          clientType: 'E_TCPADMIN',
+          processName: process.argv[1] || 'node-admin',
+          pid: process.pid,
+          sessionId: 1,
+          hostName: os.hostname(),
+          features: SDK_FEATURES,
+          clusterName: '',
+          clusterNodeId: -1,
+          sdkLanguage: 'E_JAVA',
+          guidInfo: {
+            clientId: '',
+            nanoSecondsFromEpoch: 0,
+          },
+          userAgent: `${SDK_NAME}/${SDK_VERSION_STRING} (admin)`,
+        },
+      };
+
+      conn.send(buildControlEvent(clientIdentity));
+
+      const negoResponse = await this.waitForEvent(conn, EventType.CONTROL, this.options.timeout);
+      const negoParsed = parseControlPayload(negoResponse);
+
+      if (negoParsed.brokerResponse?.result?.category &&
+          negoParsed.brokerResponse.result.category !== 'E_SUCCESS') {
+        throw new Error(
+          `Broker rejected negotiation: ${negoParsed.brokerResponse.result.message || negoParsed.brokerResponse.result.category}`,
+        );
+      }
+
+      // 3. Send AdminCommand
+      const rId = 1;
+      const adminMsg = {
+        rId,
+        adminCommand: { command },
+      };
+      conn.send(buildControlEvent(adminMsg));
+
+      // 4. Await AdminCommandResponse
+      const responseBuf = await this.waitForEvent(conn, EventType.CONTROL, this.options.timeout);
+      const responseParsed = parseControlPayload(responseBuf);
+      const text = responseParsed.adminCommandResponse?.text ?? responseParsed.raw ?? '';
+
+      // 5. Graceful disconnect
+      try {
+        conn.send(buildControlEvent({ rId: 2, disconnect: {} }));
+      } catch {
+        // Ignore
+      }
+
+      return typeof text === 'string' ? text.trim() : JSON.stringify(text);
+    } finally {
+      try {
+        await conn.disconnect();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
+
+  /**
+   * Wait for a specific event type from the connection.
+   * Automatically responds to HEARTBEAT_REQ events while waiting.
+   */
+  private waitForEvent(
+    conn: BmqConnection,
+    expectedType: EventType,
+    timeoutMs: number,
+  ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-      const socket = new net.Socket();
-      let response = '';
-      let settled = false;
-
       const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          reject(new Error(`Admin command timed out after ${this.options.timeout}ms: ${command}`));
+        conn.removeListener('event', handler);
+        reject(new Error(`Admin command timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const handler = (type: EventType, data: Buffer) => {
+        // Auto-reply to heartbeat requests to keep the connection alive
+        if (type === EventType.HEARTBEAT_REQ) {
+          try {
+            conn.send(buildHeartbeatResponse());
+          } catch {
+            // Ignore — connection may be closing
+          }
+          return;
         }
-      }, this.options.timeout);
 
-      socket.on('connect', () => {
-        socket.write(command + '\n');
-      });
-
-      socket.on('data', (data: Buffer) => {
-        response += data.toString('utf8');
-      });
-
-      socket.on('end', () => {
-        if (!settled) {
-          settled = true;
+        if (type === expectedType) {
           clearTimeout(timer);
-          resolve(response.trim());
+          conn.removeListener('event', handler);
+          resolve(data);
         }
-      });
+      };
 
-      socket.on('close', () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve(response.trim());
-        }
-      });
-
-      socket.on('error', (err: Error) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error(`Admin command failed: ${err.message}`));
-        }
-      });
-
-      socket.connect(this.options.port, this.options.host);
+      conn.on('event', handler);
     });
   }
 
@@ -352,9 +437,19 @@ export class BrokerAdmin extends EventEmitter {
       const parsed = JSON.parse(response);
       return parsed.clusters || [];
     } catch {
-      // Parse from text: extract cluster names
-      const lines = response.split('\n').filter(l => l.trim());
-      return lines;
+      // Parse from text format:
+      //   The following clusters are active:
+      //       [LOCAL ] local:
+      //           localhost           0      UNSPECIFIED
+      const names: string[] = [];
+      const lines = response.split('\n');
+      for (const line of lines) {
+        const match = line.match(/^\s+\[\s*\w+\s*\]\s+(\S+?):/);
+        if (match) {
+          names.push(match[1]);
+        }
+      }
+      return names;
     }
   }
 
@@ -580,18 +675,58 @@ export class BrokerAdmin extends EventEmitter {
 
   private parseClusterStatus(name: string, data: any): ClusterStatus {
     if (data.raw) {
+      // Parse the text-format cluster status output
+      const text: string = data.raw;
+      const isHealthy = /Is Healthy\s*:\s*Yes/i.test(text);
+
+      // Parse nodes
+      const nodeStatuses: ClusterNodeStatus[] = [];
+      const nodeRegex = /\[([^\]]+)\]\s*\n\s*IsConnected:\s*(\S+)\s*\n\s*Node Status:\s*(\S+)\s*\n\s*Primary for partitions:\s*\[([^\]]*)\]/g;
+      let nodeMatch;
+      while ((nodeMatch = nodeRegex.exec(text)) !== null) {
+        const partitions = nodeMatch[4].trim()
+          ? nodeMatch[4].trim().split(/\s+/).map(Number)
+          : [];
+        nodeStatuses.push({
+          description: nodeMatch[1].trim(),
+          isAvailable: nodeMatch[3].trim() === 'E_AVAILABLE',
+          status: nodeMatch[3].trim(),
+          primaryForPartitionIds: partitions,
+        });
+      }
+
+      // Parse elector info
+      const electorState = text.match(/Self State\s*:\s*(\S+)/)?.[1] ?? 'UNKNOWN';
+      const leaderNode = text.match(/Leader Node\s*:\s*(.+)/)?.[1]?.trim() ?? '';
+      const leaderStatus = text.match(/Leader Status\s*:\s*(\S+)/)?.[1] ?? 'UNDEFINED';
+
+      // Parse partitions
+      const partitionsInfo: PartitionInfo[] = [];
+      const partRegex = /PartitionId:\s*(\d+)\s*\n\s*Num Queues\s*:\s*mapped\s*\((\d+)\),\s*active\s*\((\d+)\)\s*\n\s*Primary Node\s*:\s*(.+)\n\s*Primary LeaseId:\s*(\d+)\s*\n\s*Primary Status\s*:\s*(\S+)/g;
+      let partMatch;
+      while ((partMatch = partRegex.exec(text)) !== null) {
+        partitionsInfo.push({
+          partitionId: parseInt(partMatch[1], 10),
+          numQueuesMapped: parseInt(partMatch[2], 10),
+          numActiveQueues: parseInt(partMatch[3], 10),
+          primaryNode: partMatch[4].trim(),
+          primaryLeaseId: parseInt(partMatch[5], 10),
+          primaryStatus: partMatch[6].trim(),
+        });
+      }
+
       return {
         name,
-        description: data.raw,
+        description: text,
         selfNodeDescription: '',
-        isHealthy: !data.raw.includes('unhealthy'),
-        nodeStatuses: [],
+        isHealthy,
+        nodeStatuses,
         electorInfo: {
-          electorState: 'UNKNOWN',
-          leaderNode: '',
-          leaderStatus: 'UNDEFINED',
+          electorState,
+          leaderNode,
+          leaderStatus,
         },
-        partitionsInfo: [],
+        partitionsInfo,
         queuesInfo: [],
         clusterStorageSummary: { totalMappedBytes: 0, fileStores: [] },
       };

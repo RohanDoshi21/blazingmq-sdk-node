@@ -1,8 +1,8 @@
 // ============================================================================
 // BlazingMQ Node.js SDK — Unit Tests for BrokerAdmin
 //
-// These tests exercise the BrokerAdmin class by mocking TCP connections.
-// No live broker is required.
+// These tests exercise the BrokerAdmin class by mocking the BMQ binary
+// protocol over TCP.  No live broker is required.
 // ============================================================================
 
 import * as net from 'net';
@@ -12,32 +12,106 @@ import {
   ClusterStorageSummary,
   QueueInternals,
 } from '../src/broker-admin';
+import {
+  buildControlEvent,
+  parseControlPayload,
+  decodeEventHeader,
+} from '../src/protocol/codec';
+import { EventType, EVENT_HEADER_SIZE } from '../src/protocol/constants';
 
 // ============================================================================
-// Mock TCP Server Helper
+// Mock BMQ Broker Helper
 // ============================================================================
 
 /**
- * Creates a local TCP server that responds to admin commands with the
- * given handler function. Returns the server and port for BrokerAdmin.
+ * Creates a local TCP server that speaks the BMQ binary protocol:
+ *   1. Receives ClientIdentity negotiation → replies with BrokerResponse
+ *   2. Receives AdminCommand → extracts the command string, calls `handler`,
+ *      and replies with an AdminCommandResponse containing the handler result
+ *   3. Handles Disconnect gracefully
+ *
+ * The `handler` receives the raw admin command string and returns the text
+ * that should appear in the AdminCommandResponse.
+ *
+ * When `captureCommands` is provided, each received admin command string
+ * is pushed into the array so tests can verify what was sent.
  */
 function createMockBroker(
   handler: (command: string) => string,
+  captureCommands?: string[],
 ): Promise<{ server: net.Server; port: number }> {
   return new Promise((resolve) => {
     const server = net.createServer((socket) => {
-      let buffer = '';
-      socket.on('data', (data) => {
-        buffer += data.toString('utf8');
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const cmd = line.trim();
-          if (cmd) {
-            const response = handler(cmd);
-            socket.end(response);
+      let readBuffer = Buffer.alloc(0);
+
+      socket.on('data', (chunk) => {
+        readBuffer = Buffer.concat([readBuffer, chunk]);
+
+        // Process complete events from the buffer
+        while (readBuffer.length >= EVENT_HEADER_SIZE) {
+          const word0 = readBuffer.readUInt32BE(0);
+          const eventLength = word0 & 0x7fffffff;
+
+          if (eventLength < EVENT_HEADER_SIZE || readBuffer.length < eventLength) {
+            break; // Need more data
+          }
+
+          const eventBuf = readBuffer.subarray(0, eventLength);
+          readBuffer = readBuffer.subarray(eventLength);
+
+          const header = decodeEventHeader(eventBuf);
+
+          if (header.type === EventType.CONTROL) {
+            let payload: any;
+            try {
+              payload = parseControlPayload(eventBuf);
+            } catch {
+              continue;
+            }
+
+            if (payload.clientIdentity) {
+              // Negotiation — reply with BrokerResponse
+              const brokerResponse = {
+                brokerResponse: {
+                  result: { category: 'E_SUCCESS', code: 0, message: '' },
+                  protocolVersion: 1,
+                  brokerVersion: 999999,
+                  isDeprecatedSdk: false,
+                },
+              };
+              socket.write(buildControlEvent(brokerResponse));
+            } else if (payload.adminCommand) {
+              // Admin command — call handler and reply
+              const command = payload.adminCommand.command;
+              if (captureCommands) {
+                captureCommands.push(command);
+              }
+
+              const responseText = handler(command);
+              const rId = payload.rId ?? 0;
+              const adminResponse = {
+                rId,
+                adminCommandResponse: { text: responseText },
+              };
+              socket.write(buildControlEvent(adminResponse));
+            } else if (payload.disconnect !== undefined) {
+              // Disconnect — reply and close
+              const rId = payload.rId ?? 0;
+              const disconnectResponse = {
+                rId,
+                disconnectResponse: {},
+              };
+              socket.write(buildControlEvent(disconnectResponse));
+              socket.end();
+            }
+          } else if (header.type === EventType.HEARTBEAT_RSP) {
+            // Client replying to heartbeat — ignore
           }
         }
+      });
+
+      socket.on('error', () => {
+        // Ignore client-side connection resets
       });
     });
 
@@ -113,7 +187,7 @@ describe('BrokerAdmin', () => {
     test('rejects on connection error', async () => {
       // Use a port that nothing is listening on
       const admin = new BrokerAdmin({ host: '127.0.0.1', port: 1 });
-      await expect(admin.sendCommand('HELP')).rejects.toThrow('Admin command failed');
+      await expect(admin.sendCommand('HELP')).rejects.toThrow(/ECONNREFUSED|EACCES|connect/);
     });
 
     test('rejects on timeout', async () => {
@@ -213,7 +287,20 @@ describe('BrokerAdmin', () => {
     });
 
     test('listClusters falls back to text parsing', async () => {
-      ({ server, port } = await createMockBroker(() => 'cluster-alpha\ncluster-beta'));
+      // Real broker text format:
+      //   The following clusters are active:
+      //       [LOCAL ] cluster-alpha:
+      //           localhost           0      UNSPECIFIED
+      //       [LOCAL ] cluster-beta:
+      //           localhost           0      UNSPECIFIED
+      const textOutput = [
+        'The following clusters are active:',
+        '      [LOCAL ] cluster-alpha:',
+        '          localhost           0      UNSPECIFIED',
+        '      [LOCAL ] cluster-beta:',
+        '          localhost           0      UNSPECIFIED',
+      ].join('\n');
+      ({ server, port } = await createMockBroker(() => textOutput));
 
       const admin = new BrokerAdmin({ host: '127.0.0.1', port });
       const clusters = await admin.listClusters();
@@ -295,13 +382,19 @@ describe('BrokerAdmin', () => {
     });
 
     test('getClusterStatus handles non-JSON response gracefully', async () => {
-      ({ server, port } = await createMockBroker(() => 'cluster is healthy'));
+      // Real broker text format includes "Is Healthy : Yes" which the regex parser detects
+      const textOutput = [
+        'Cluster: test',
+        'Is Healthy : Yes',
+        'Nodes: (none)',
+      ].join('\n');
+      ({ server, port } = await createMockBroker(() => textOutput));
 
       const admin = new BrokerAdmin({ host: '127.0.0.1', port });
       const status = await admin.getClusterStatus('test');
 
       expect(status.name).toBe('test');
-      expect(status.isHealthy).toBe(true); // doesn't contain 'unhealthy'
+      expect(status.isHealthy).toBe(true);
       expect(status.nodeStatuses).toEqual([]);
     });
 
