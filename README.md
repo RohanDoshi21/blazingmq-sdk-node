@@ -1,6 +1,6 @@
 # BlazingMQ Node.js SDK
 
-A **pure-JavaScript** Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
+An **unofficial pure-JavaScript** Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
 Bloomberg's high-performance, open-source message queue system.
 
 This SDK implements the BlazingMQ binary wire protocol natively over TCP. No C++ bindings,

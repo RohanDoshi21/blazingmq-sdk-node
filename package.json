@@ -1,7 +1,7 @@
 {
   "name": "blazingmq",
   "version": "1.0.0",
-  "description": "Pure-JavaScript Node.js SDK for BlazingMQ — Bloomberg's high-performance open-source message queue",
+  "description": "Unofficial Pure-JavaScript Node.js SDK for BlazingMQ — Bloomberg's high-performance open-source message queue",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
