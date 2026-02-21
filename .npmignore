@@ -1,0 +1,17 @@
+# Publish only the built output, README, LICENSE, and CHANGELOG.
+# Everything else is excluded.
+
+src/
+tests/
+examples/
+docs/
+coverage/
+.git/
+.gitignore
+.vscode/
+tsconfig.json
+jest.config.js
+CONTRIBUTING.md
+*.tgz
+*.log
+.DS_Store

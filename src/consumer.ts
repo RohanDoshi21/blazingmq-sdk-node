@@ -16,12 +16,9 @@ import { Session } from './session';
 import {
   SessionOptions,
   QueueOptions,
-  DEFAULT_QUEUE_OPTIONS,
   Message,
   MessageHandle,
   SessionEventCallback,
-  SessionEvent,
-  SessionEventType,
   MessageCallback,
 } from './types';
 import { BlazingMQError, QueueError } from './errors';
@@ -35,6 +32,13 @@ export interface ConsumerOptions extends SessionOptions {
 
   /** Whether to auto-confirm messages after the callback returns. Default: false */
   autoConfirm?: boolean;
+
+  /**
+   * Maximum number of messages to buffer for the async iterator.
+   * When the buffer is full, new messages are dropped with a warning.
+   * Default: 10000. Set to 0 for unlimited (not recommended).
+   */
+  maxIteratorBufferSize?: number;
 }
 
 export interface SubscribeOptions {
@@ -85,7 +89,7 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
   private options: ConsumerOptions;
   private subscriptions = new Map<string, SubscribeOptions>();
   private started = false;
-  private draining = false;
+  private readonly maxIteratorBufferSize: number;
 
   // For async iterator support
   private messageQueue: Array<{ message: Message; handle: MessageHandle }> = [];
@@ -95,6 +99,7 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
   constructor(options: ConsumerOptions = {}) {
     super();
     this.options = options;
+    this.maxIteratorBufferSize = options.maxIteratorBufferSize ?? 10000;
     this.session = new Session(options);
 
     if (options.onSessionEvent) {
@@ -120,7 +125,6 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
    */
   async stop(): Promise<void> {
     if (!this.started) return;
-    this.draining = true;
 
     // Drain all subscriptions — pause consumption, then close
     for (const [uri] of this.subscriptions) {
@@ -135,12 +139,13 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
     await this.session.stop();
     this.subscriptions.clear();
 
-    // Signal end to async iterators
+    // Signal end to async iterators and drain buffers
     this.iteratorDone = true;
     for (const resolver of this.messageResolvers) {
-      resolver({ value: undefined as any, done: true });
+      resolver({ value: undefined as never, done: true });
     }
     this.messageResolvers = [];
+    this.messageQueue = [];
   }
 
   /**
@@ -228,7 +233,7 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
     return {
       next: (): Promise<IteratorResult<{ message: Message; handle: MessageHandle }>> => {
         if (this.iteratorDone) {
-          return Promise.resolve({ value: undefined as any, done: true });
+          return Promise.resolve({ value: undefined as never, done: true });
         }
 
         // If there are queued messages, return immediately
@@ -245,7 +250,7 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
 
       return: (): Promise<IteratorResult<{ message: Message; handle: MessageHandle }>> => {
         this.iteratorDone = true;
-        return Promise.resolve({ value: undefined as any, done: true });
+        return Promise.resolve({ value: undefined as never, done: true });
       },
     };
   }
@@ -301,9 +306,11 @@ export class Consumer extends EventEmitter implements AsyncIterable<{ message: M
     const resolver = this.messageResolvers.shift();
     if (resolver) {
       resolver({ value: item, done: false });
-    } else {
+    } else if (this.maxIteratorBufferSize === 0 || this.messageQueue.length < this.maxIteratorBufferSize) {
       this.messageQueue.push(item);
     }
+    // If buffer is full and no resolver, message is dropped from iterator
+    // (but callbacks still fired above)
 
     // Emit event
     this.emit('message', message, wrappedHandle);

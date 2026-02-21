@@ -40,7 +40,7 @@ import {
   PutMessageOptions,
   guidToHex,
 } from './protocol/codec';
-import { BmqConnection, ConnectionState } from './transport/connection';
+import { BmqConnection } from './transport/connection';
 import {
   BlazingMQError,
   BrokerTimeoutError,
@@ -128,7 +128,6 @@ const DEFAULT_TIMEOUTS: Required<TimeoutOptions> = {
  */
 export class Session extends EventEmitter {
   private connection: BmqConnection;
-  private options: SessionOptions;
   private timeouts: Required<TimeoutOptions>;
   private compressionAlgorithm: CompressionAlgorithmType;
 
@@ -148,21 +147,23 @@ export class Session extends EventEmitter {
   // Heartbeat tracking
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private lastHeartbeatReq = 0;
-  private missedHeartbeats = 0;
   private heartbeatIntervalMs = 3000;
   private maxMissedHeartbeats = 10;
 
   // Session state
   private started = false;
-  private brokerVersion: number | null = null;
 
   // Callbacks
   private onSessionEvent?: SessionEventCallback;
   private onMessage?: MessageCallback;
 
+  // Bound event handlers (for proper removal on cleanup)
+  private readonly boundHandleEvent: (type: EventType, data: Buffer) => void;
+  private readonly boundHandleError: (err: Error) => void;
+  private readonly boundHandleDisconnect: () => void;
+
   constructor(options: SessionOptions = {}) {
     super();
-    this.options = options;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...options.timeouts };
     this.compressionAlgorithm =
       options.messageCompressionAlgorithm ?? CompressionAlgorithmType.NONE;
@@ -178,23 +179,28 @@ export class Session extends EventEmitter {
       reconnect: options.reconnect ?? false,
     });
 
-    // Wire up connection events
-    this.connection.on('event', this.handleEvent.bind(this));
-    this.connection.on('error', (err) => {
+    // Create bound handlers so we can remove them on cleanup
+    this.boundHandleEvent = this.handleEvent.bind(this);
+    this.boundHandleError = (err: Error) => {
       this.emitSessionEvent({
         type: SessionEventType.ERROR,
         message: err.message,
         error: err,
       });
-    });
-    this.connection.on('disconnected', () => {
+    };
+    this.boundHandleDisconnect = () => {
       if (this.started) {
         this.emitSessionEvent({
           type: SessionEventType.CONNECTION_LOST,
           message: 'Connection to broker lost',
         });
       }
-    });
+    };
+
+    // Wire up connection events
+    this.connection.on('event', this.boundHandleEvent);
+    this.connection.on('error', this.boundHandleError);
+    this.connection.on('disconnected', this.boundHandleDisconnect);
   }
 
   /**
@@ -260,6 +266,11 @@ export class Session extends EventEmitter {
 
     // Stop heartbeat
     this.stopHeartbeat();
+
+    // Remove connection event listeners to prevent memory leaks
+    this.connection.removeListener('event', this.boundHandleEvent);
+    this.connection.removeListener('error', this.boundHandleError);
+    this.connection.removeListener('disconnected', this.boundHandleDisconnect);
 
     // Close connection
     await this.connection.disconnect();
@@ -710,7 +721,6 @@ export class Session extends EventEmitter {
           `Broker rejected negotiation: ${br.result.message || br.result.category}`,
         );
       }
-      this.brokerVersion = br.brokerVersion;
 
       // Extract heartbeat settings
       if (br.heartbeatIntervalMs) {
@@ -945,7 +955,6 @@ export class Session extends EventEmitter {
    */
   private handleHeartbeatReq(): void {
     this.lastHeartbeatReq = Date.now();
-    this.missedHeartbeats = 0;
 
     try {
       const response = buildHeartbeatResponse();

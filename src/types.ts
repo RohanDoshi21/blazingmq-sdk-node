@@ -15,22 +15,10 @@ export interface SessionOptions {
   /** Compression algorithm for outgoing messages. Default: NONE */
   messageCompressionAlgorithm?: CompressionAlgorithmType;
 
-  /** Number of processing threads. Default: 1 (not used in Node.js — single-threaded) */
-  numProcessingThreads?: number;
-
-  /** Blob buffer size in bytes. Default: 4096 */
-  blobBufferSize?: number;
-
-  /** Channel high watermark in bytes. Default: 128MB */
-  channelHighWatermark?: number;
-
-  /** Stats dump interval in seconds. 0 to disable. Default: 300 (5 min) */
-  statsDumpInterval?: number;
-
   /** Timeout configuration */
   timeouts?: TimeoutOptions;
 
-  /** Whether to automatically reconnect. Default: false */
+  /** Whether to automatically reconnect on unintentional disconnect. Default: false */
   reconnect?: boolean;
 }
 
@@ -79,12 +67,6 @@ export const DEFAULT_QUEUE_OPTIONS: Required<QueueOptions> = {
 // ============================================================================
 // Message Types
 // ============================================================================
-
-/** Property values map — name to value */
-export type PropertyValueMap = Map<string, boolean | number | bigint | string | Buffer>;
-
-/** Property types map — name to type */
-export type PropertyTypeMap = Map<string, PropertyType>;
 
 /** Combined property entry with type and value */
 export interface PropertyEntry {

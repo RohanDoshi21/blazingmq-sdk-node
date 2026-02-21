@@ -9,15 +9,11 @@ import { Session } from './session';
 import {
   SessionOptions,
   QueueOptions,
-  PostOptions,
   Ack,
   AckCallback,
   SessionEventCallback,
-  SessionEvent,
-  SessionEventType,
-  PropertyEntry,
 } from './types';
-import { PropertyType, CompressionAlgorithmType, AckResult } from './protocol/constants';
+import { PropertyType, CompressionAlgorithmType } from './protocol/constants';
 import { BlazingMQError, QueueError } from './errors';
 
 export interface ProducerOptions extends SessionOptions {

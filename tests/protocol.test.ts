@@ -12,7 +12,6 @@ import {
   parseControlPayload,
   buildHeartbeatResponse,
   buildConfirmEvent,
-  buildPutEvent,
   encodeMessageProperties,
   decodeMessageProperties,
   crc32c,
@@ -24,7 +23,6 @@ import {
   EVENT_HEADER_SIZE,
   PROTOCOL_VERSION,
   PropertyType,
-  CompressionAlgorithmType,
 } from '../src/protocol/constants';
 
 // ============================================================================

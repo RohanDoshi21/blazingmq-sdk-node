@@ -1,60 +1,65 @@
 # BlazingMQ Node.js SDK
 
-A production-ready, pure-JavaScript Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) — Bloomberg's high-performance, open-source message queue system.
+A **pure-JavaScript** Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
+Bloomberg's high-performance, open-source message queue system.
 
-This SDK implements the BlazingMQ wire protocol natively in Node.js (no C++ bindings required), providing a clean, idiomatic JavaScript/TypeScript API for producing and consuming messages.
+This SDK implements the BlazingMQ binary wire protocol natively over TCP. No C++ bindings,
+no native modules, no `node-gyp` — just TypeScript that speaks the protocol directly.
 
-## Features
-
-- **Pure JavaScript** — No native dependencies or C++ compilation required
-- **Full Protocol Support** — Implements the BlazingMQ binary wire protocol (PUT, PUSH, ACK, CONFIRM, CONTROL, HEARTBEAT)
-- **Producer API** — Publish messages with optional properties, compression, and delivery confirmation (ACK)
-- **Consumer API** — Subscribe to queues with automatic message handling, manual or auto-confirmation, and async iterator support
-- **Admin API** — Queue management, inspection, draining, and health checks
-- **Message Properties** — Full support for typed properties (string, int32, int64, bool, binary)
-- **TypeScript** — Complete type definitions with strict typing
-- **Compression** — Zlib compression support for large payloads
-- **Heartbeat** — Automatic heartbeat response to keep connections alive
-
-## Installation
-
-```bash
+```
 npm install blazingmq
 ```
 
-Or from source:
+## Table of Contents
 
-```bash
-git clone https://github.com/RohanDoshi21/blazingmq-sdk-node
-npm install
-npm run build
-```
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+  - [Architecture](#architecture)
+  - [Wire Protocol](#wire-protocol)
+  - [Transport Layer](#transport-layer)
+  - [Session Layer](#session-layer)
+  - [Message Flow](#message-flow)
+- [API Reference](#api-reference)
+  - [Producer](#producer)
+  - [Consumer](#consumer)
+  - [Admin](#admin)
+  - [Session (Low-Level)](#session-low-level)
+- [Configuration](#configuration)
+- [Error Handling](#error-handling)
+- [Examples](#examples)
+- [Running Tests](#running-tests)
+- [Running the Broker](#running-the-broker)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
 
 ## Quick Start
 
-### Producer
+### Producing Messages
 
 ```typescript
 import { Producer, AckResult } from 'blazingmq';
 
-const producer = new Producer({
-  broker: 'tcp://localhost:30114',
-});
-
+const producer = new Producer({ broker: 'tcp://localhost:30114' });
 await producer.start();
 await producer.openQueue('bmq://bmq.test.mem.priority/my-queue');
 
-// Publish and wait for broker acknowledgment
 const ack = await producer.publishAndWait({
   queueUri: 'bmq://bmq.test.mem.priority/my-queue',
   payload: 'Hello, World!',
+  properties: {
+    eventType: 'greeting',
+    priority: 1,
+    isVip: true,
+  },
 });
 console.log('ACK:', AckResult[ack.status]); // "SUCCESS"
 
 await producer.stop();
 ```
 
-### Consumer
+### Consuming Messages
 
 ```typescript
 import { Consumer, PropertyType } from 'blazingmq';
@@ -63,33 +68,23 @@ const consumer = new Consumer({
   broker: 'tcp://localhost:30114',
   onMessage: (msg, handle) => {
     console.log('Received:', msg.data.toString());
-    console.log('Queue:', msg.queueUri);
-    console.log('GUID:', msg.guidHex);
 
-    // Access message properties
     for (const [key, entry] of msg.properties) {
       console.log(`  ${key}: ${entry.value} (${PropertyType[entry.type]})`);
     }
 
-    // Confirm the message (required for at-least-once delivery)
-    handle.confirm();
+    handle.confirm(); // Acknowledge the message
   },
 });
 
 await consumer.start();
 await consumer.subscribe({
   queueUri: 'bmq://bmq.test.mem.priority/my-queue',
-  options: {
-    maxUnconfirmedMessages: 1024,
-    consumerPriority: 1,
-  },
+  options: { maxUnconfirmedMessages: 1024, consumerPriority: 1 },
 });
-
-// Consumer runs until stopped
-// process.on('SIGINT', () => consumer.stop());
 ```
 
-### Consumer with Async Iterator
+### Async Iterator Pattern
 
 ```typescript
 const consumer = new Consumer({ broker: 'tcp://localhost:30114' });
@@ -97,149 +92,282 @@ await consumer.start();
 await consumer.subscribe({ queueUri: 'bmq://bmq.test.mem.priority/my-queue' });
 
 for await (const { message, handle } of consumer) {
-  console.log('Received:', message.data.toString());
+  console.log(message.data.toString());
   handle.confirm();
 }
 ```
 
-### Message Properties
+---
+
+## How It Works
+
+### Architecture
+
+The SDK is built in four layers, each with a clear responsibility:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 4: High-Level APIs                           │
+│  Producer · Consumer · Admin                        │
+├─────────────────────────────────────────────────────┤
+│  Layer 3: Session                                   │
+│  (Negotiation, queue lifecycle, ACK correlation,    │
+│   publish/subscribe, heartbeat)                     │
+├─────────────────────────────────────────────────────┤
+│  Layer 2: Protocol Codec                            │
+│  (Binary encoding/decoding for all event types)     │
+├─────────────────────────────────────────────────────┤
+│  Layer 1: Transport                                 │
+│  (TCP socket, event framing, stream reassembly)     │
+└─────────────────────────────────────────────────────┘
+                        │
+                   TCP Socket
+                        │
+              ┌─────────┴─────────┐
+              │  BlazingMQ Broker  │
+              └───────────────────┘
+```
+
+**Layer 1 (Transport)** manages the raw TCP connection. It accumulates incoming
+bytes and reassembles them into complete BlazingMQ events using the 8-byte
+EventHeader framing protocol.
+
+**Layer 2 (Protocol Codec)** is a stateless library of pure functions that
+encode/decode every binary message type: EventHeaders, PUT/PUSH/ACK/CONFIRM
+messages, control events (JSON), message properties, CRC32-C checksums, and
+4-byte-aligned padding.
+
+**Layer 3 (Session)** is the protocol state machine. It handles the negotiation
+handshake, manages queue lifecycle (open/configure/close), publishes messages
+with correlation IDs for ACK matching, dispatches incoming PUSH messages to
+callbacks, and responds to heartbeats.
+
+**Layer 4 (High-Level APIs)** wraps the Session into ergonomic, task-oriented
+interfaces: Producer (publish), Consumer (subscribe with callbacks or async
+iterators), and Admin (queue management).
+
+### Wire Protocol
+
+BlazingMQ uses a custom binary protocol over TCP. Every transmission is an
+**event** — a discrete message with an 8-byte header:
+
+```
+Byte:  0       1       2       3       4       5       6       7
+     ┌───────────────────────────┬───────┬───────┬───────┬───────┐
+     │ Fragment(1) │ Length(31)  │PV│Type│ HdrW  │ TySpc │ Rsvd  │
+     └───────────────────────────┴───────┴───────┴───────┴───────┘
+```
+
+The **Length** field (31 bits, big-endian) tells the transport layer how many
+bytes to accumulate before it has a complete event. The **Type** field (6 bits)
+determines how the payload is encoded:
+
+| Type | Name          | Direction       | Encoding | Purpose                          |
+|------|---------------|-----------------|----------|----------------------------------|
+| 1    | CONTROL       | Bidirectional   | JSON     | Negotiation, queue ops, disconnect |
+| 2    | PUT           | Client→Broker   | Binary   | Publish a message                |
+| 3    | CONFIRM       | Client→Broker   | Binary   | Confirm a received message       |
+| 4    | PUSH          | Broker→Client   | Binary   | Deliver a message to consumer    |
+| 5    | ACK           | Broker→Client   | Binary   | Confirm a published message      |
+| 11   | HEARTBEAT_REQ | Broker→Client   | None     | Liveness check (header only)     |
+| 12   | HEARTBEAT_RSP | Client→Broker   | None     | Liveness response (header only)  |
+
+**Control events** carry JSON payloads (UTF-8, forward-slashes escaped, padded
+to 4-byte boundaries). The first exchange is always a negotiation: the client
+sends `clientIdentity`, the broker responds with `brokerResponse`.
+
+**Binary events** (PUT, PUSH, ACK, CONFIRM) use fixed-size headers with
+bit-packed fields. For example, a PUT message has a 36-byte header containing
+flags, queue ID, 24-bit correlation ID, CRC32-C checksum, and compression type.
+
+All data is **big-endian** and **4-byte aligned** using a fill-with-count
+padding scheme: padding bytes contain their own count (e.g., 3 bytes of
+`0x03` for 3-byte padding).
+
+📖 For the complete wire format specification, see [docs/protocol.md](./docs/protocol.md).
+
+### Transport Layer
+
+The transport layer solves **TCP stream reassembly**. TCP delivers a continuous
+byte stream, but BlazingMQ communicates in discrete events. The `BmqConnection`
+class:
+
+1. Accumulates incoming TCP data into a buffer.
+2. Reads the 4-byte length from the EventHeader.
+3. Waits until the full event has arrived.
+4. Extracts the event and emits it via Node.js `EventEmitter`.
+5. Loops to handle any remaining data.
+
+This is a classic length-prefixed framing state machine. The connection also
+supports automatic reconnection with exponential backoff.
+
+📖 See [docs/transport.md](./docs/transport.md) for details.
+
+### Session Layer
+
+The Session is the protocol state machine:
+
+- **Negotiation** — Exchanges `clientIdentity` / `brokerResponse` on connect.
+- **Queue lifecycle** — open (register + configure subscription), close
+  (deconfigure + deregister), using JSON control messages with `rId` correlation.
+- **Publishing** — Encodes PUT events with 24-bit correlation IDs. When the
+  broker ACKs, the ID is matched to the original publish callback.
+- **Consuming** — Parses PUSH events, looks up the queue URI, and invokes the
+  registered message callback.
+- **Heartbeat** — Immediately responds to HEARTBEAT_REQ with HEARTBEAT_RSP.
+
+📖 See [docs/session.md](./docs/session.md) for the full specification.
+
+### Message Flow
+
+**Publishing (Client → Broker → ACK):**
+
+```
+publishAndWait("Hello")
+  → encode PUT event (36-byte header + payload + CRC32-C + padding)
+  → TCP write
+  → broker stores message, sends ACK event
+  → parse ACK, match correlationId
+  → resolve promise with Ack { status: SUCCESS }
+```
+
+**Consuming (Broker → Client → CONFIRM):**
+
+```
+broker has message for subscribed queue
+  → TCP delivers PUSH event
+  → parse PushHeader, extract GUID + payload + properties
+  → invoke onMessage callback
+  → user calls handle.confirm()
+  → encode CONFIRM event (queueId + GUID)
+  → TCP write → broker marks message confirmed
+```
+
+---
+
+## API Reference
+
+### Producer
 
 ```typescript
-// Producing with properties
-await producer.publishAndWait({
-  queueUri: 'bmq://bmq.test.mem.priority/my-queue',
-  payload: JSON.stringify({ event: 'user_signup', userId: 42 }),
-  properties: {
-    eventType: 'user_signup',    // → STRING
-    priority: 1,                 // → INT32 (auto-inferred)
-    isVip: true,                 // → BOOL
-    rawData: Buffer.from([1,2]), // → BINARY
-  },
-  propertyTypeOverrides: {
-    priority: PropertyType.INT32, // explicit type override
-  },
-});
+const producer = new Producer(options?: ProducerOptions);
+```
 
-// Consuming with properties
-consumer.onMessage = (msg, handle) => {
-  for (const [key, { type, value }] of msg.properties) {
-    console.log(`${key}: ${value} (${PropertyType[type]})`);
-  }
-  handle.confirm();
-};
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `start()` | `Promise<void>` | Connect to broker |
+| `stop()` | `Promise<void>` | Close all queues and disconnect |
+| `openQueue(uri, options?)` | `Promise<void>` | Open a queue for writing |
+| `closeQueue(uri)` | `Promise<void>` | Close a queue |
+| `publish(options)` | `number` | Fire-and-forget publish (returns correlationId) |
+| `publishAndWait(options, timeout?)` | `Promise<Ack>` | Publish and wait for broker ACK |
+| `publishBatch(messages)` | `number[]` | Publish multiple messages |
+
+**PublishOptions:**
+
+```typescript
+{
+  queueUri?: string;         // Queue URI (or use ProducerOptions.defaultQueueUri)
+  payload: string | Buffer;  // Message payload
+  properties?: Record<string, boolean | number | bigint | string | Buffer>;
+  propertyTypeOverrides?: Record<string, PropertyType>;
+  compression?: CompressionAlgorithmType;
+  onAck?: (ack: Ack) => void;  // Per-message ACK callback
+}
+```
+
+### Consumer
+
+```typescript
+const consumer = new Consumer(options?: ConsumerOptions);
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `start()` | `Promise<void>` | Connect to broker |
+| `stop()` | `Promise<void>` | Drain, close all queues, disconnect |
+| `subscribe(options)` | `Promise<void>` | Subscribe to a queue |
+| `unsubscribe(uri)` | `Promise<void>` | Unsubscribe (drain + close) |
+| `reconfigure(uri, options)` | `Promise<void>` | Change queue options |
+| `confirm(message)` | `void` | Confirm a message |
+| `isSubscribed(uri)` | `boolean` | Check subscription status |
+| `[Symbol.asyncIterator]()` | `AsyncIterator` | Async iteration over messages |
+
+**ConsumerOptions:**
+
+```typescript
+{
+  broker?: string;
+  onMessage?: (message: Message, handle: MessageHandle) => void;
+  autoConfirm?: boolean;           // Auto-confirm after callback (default: false)
+  maxIteratorBufferSize?: number;   // Async iterator buffer limit (default: 10000)
+}
 ```
 
 ### Admin
 
 ```typescript
-import { Admin } from 'blazingmq';
-
-const admin = new Admin({ broker: 'tcp://localhost:30114' });
-await admin.start();
-
-// Create a queue (open with read+write)
-await admin.createQueue('bmq://bmq.test.mem.priority/my-queue');
-
-// Inspect queues
-const queues = admin.getQueueInfo();
-console.log(queues);
-
-// Drain a queue (pause consumption)
-await admin.drainQueue('bmq://bmq.test.mem.priority/my-queue');
-
-// Restore a drained queue
-await admin.restoreQueue('bmq://bmq.test.mem.priority/my-queue');
-
-await admin.stop();
+const admin = new Admin(options?: AdminOptions);
 ```
 
-## API Reference
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `start()` | `Promise<void>` | Connect to broker |
+| `stop()` | `Promise<void>` | Close all managed queues, disconnect |
+| `createQueue(uri, options?)` | `Promise<void>` | Open queue with read+write |
+| `deleteQueue(uri)` | `Promise<void>` | Close a managed queue |
+| `configureQueue(uri, options)` | `Promise<void>` | Reconfigure queue |
+| `drainQueue(uri)` | `Promise<void>` | Pause consumption |
+| `restoreQueue(uri, options?)` | `Promise<void>` | Resume after drain |
+| `getQueueInfo()` | `QueueInfo[]` | Get all managed queue info |
+| `pingBroker()` | `boolean` | Check connection health |
 
 ### Session (Low-Level)
 
-The `Session` class provides direct access to all BlazingMQ operations:
+The `Session` class provides direct protocol access:
 
 ```typescript
-import { Session } from 'blazingmq';
-
-const session = new Session({
-  broker: 'tcp://localhost:30114',
-  timeouts: {
-    connectTimeout: 5000,
-    openQueueTimeout: 30000,
-    closeQueueTimeout: 30000,
-    configureQueueTimeout: 30000,
-    disconnectTimeout: 5000,
-  },
-});
-
-session.setSessionEventCallback((event) => {
-  console.log(event.type, event.message);
-});
-
-session.setMessageCallback((msg, handle) => {
-  handle.confirm();
-});
-
+const session = new Session({ broker: 'tcp://localhost:30114' });
+session.setMessageCallback((msg, handle) => handle.confirm());
 await session.start();
+
 await session.openQueue({ queueUri: '...', read: true, write: true });
-session.post({ queueUri: '...', payload: '...' });
-session.confirm(message);
+const ack = await session.postAndWaitForAck({ queueUri: '...', payload: 'Hello' });
 await session.closeQueue('...');
 await session.stop();
 ```
 
-### Producer
-
-| Method | Description |
-|--------|-------------|
-| `start()` | Connect to the broker |
-| `stop()` | Close all queues and disconnect |
-| `openQueue(uri, options?)` | Open a queue for writing |
-| `closeQueue(uri)` | Close a queue |
-| `publish(options)` | Fire-and-forget publish (returns correlation ID) |
-| `publishAndWait(options, timeout?)` | Publish and wait for broker ACK |
-| `publishBatch(messages)` | Publish multiple messages |
-
-### Consumer
-
-| Method | Description |
-|--------|-------------|
-| `start()` | Connect to the broker |
-| `stop()` | Drain, close all queues, disconnect |
-| `subscribe(options)` | Subscribe to a queue |
-| `unsubscribe(uri)` | Unsubscribe from a queue |
-| `reconfigure(uri, options)` | Change queue options |
-| `confirm(message)` | Confirm a message |
-| `[Symbol.asyncIterator]()` | Async iteration over messages |
-
-### Admin
-
-| Method | Description |
-|--------|-------------|
-| `start()` | Connect to the broker |
-| `stop()` | Close all managed queues, disconnect |
-| `createQueue(uri, options?)` | Create a queue |
-| `deleteQueue(uri)` | Close a managed queue |
-| `configureQueue(uri, options)` | Reconfigure a queue |
-| `drainQueue(uri)` | Pause consumption (set limits to 0) |
-| `restoreQueue(uri, options?)` | Restore after drain |
-| `getQueueInfo()` | Get info on all managed queues |
-| `pingBroker()` | Check connection health |
-
-## Queue URIs
-
-BlazingMQ queue URIs follow the format:
-```
-bmq://<domain>/<queue-name>
-```
-
-For the single-node Docker setup, use:
-```
-bmq://bmq.test.mem.priority/<queue-name>
-```
+---
 
 ## Configuration
+
+### Session Options
+
+```typescript
+{
+  broker?: string;           // "tcp://host:port" (default: "tcp://localhost:30114")
+  reconnect?: boolean;       // Auto-reconnect on disconnect (default: false)
+  messageCompressionAlgorithm?: CompressionAlgorithmType; // Default: NONE
+  timeouts?: {
+    connectTimeout?: number;         // ms (default: 5000)
+    disconnectTimeout?: number;      // ms (default: 5000)
+    openQueueTimeout?: number;       // ms (default: 30000)
+    configureQueueTimeout?: number;  // ms (default: 30000)
+    closeQueueTimeout?: number;      // ms (default: 30000)
+  }
+}
+```
+
+### Queue Options
+
+```typescript
+{
+  maxUnconfirmedMessages?: number;   // default: 1024
+  maxUnconfirmedBytes?: number;      // default: 33554432 (32MB)
+  consumerPriority?: number;         // default: 0 (higher = preferred)
+  suspendsOnBadHostHealth?: boolean; // default: false
+}
+```
 
 ### Environment Variables
 
@@ -247,101 +375,80 @@ bmq://bmq.test.mem.priority/<queue-name>
 |----------|-------------|---------|
 | `BMQ_BROKER_URI` | Broker URI | `tcp://localhost:30114` |
 
-### Session Options
+### Queue URIs
 
-```typescript
-interface SessionOptions {
-  broker?: string;                              // "tcp://host:port"
-  messageCompressionAlgorithm?: CompressionAlgorithmType;
-  reconnect?: boolean;
-  timeouts?: {
-    connectTimeout?: number;     // ms (default: 5000)
-    disconnectTimeout?: number;  // ms (default: 5000)
-    openQueueTimeout?: number;   // ms (default: 30000)
-    configureQueueTimeout?: number; // ms (default: 30000)
-    closeQueueTimeout?: number;  // ms (default: 30000)
-  };
-}
+```
+bmq://<domain>/<queue-name>
 ```
 
-### Queue Options
+Domains determine storage and routing behavior:
+- `bmq.test.mem.priority` — In-memory, priority-based (for testing)
+- `bmq.test.persistent.priority` — Persistent, priority-based
 
-```typescript
-interface QueueOptions {
-  maxUnconfirmedMessages?: number;  // default: 1024
-  maxUnconfirmedBytes?: number;     // default: 33554432 (32MB)
-  consumerPriority?: number;        // default: 0
-  suspendsOnBadHostHealth?: boolean; // default: false
-}
-```
+---
 
 ## Error Handling
 
-The SDK provides a hierarchy of error types:
+The SDK provides a typed error hierarchy:
 
 ```
-BlazingMQError              — Base error
-├── BrokerTimeoutError      — Operation timed out
-├── ConnectionError         — Connection-level failure
-├── BrokerRefusedError      — Broker rejected the operation
-├── InvalidArgumentError    — Invalid parameters
-└── QueueError              — Queue operation failure
+BlazingMQError              — Base class for all SDK errors
+├── BrokerTimeoutError      — Operation timed out waiting for broker
+├── ConnectionError         — TCP connection or negotiation failure
+├── BrokerRefusedError      — Broker explicitly refused an operation
+├── InvalidArgumentError    — Invalid parameters passed to SDK
+└── QueueError              — Queue-specific operation failure
 ```
 
-## Architecture
+All async methods reject with typed errors. Session events provide
+non-fatal error notifications.
 
-This SDK implements the BlazingMQ binary wire protocol directly over TCP:
+---
 
+## Examples
+
+```bash
+# Build first
+npm run build
+
+# End-to-end demo (producer + consumer in one script)
+node examples/run-e2e.js
+
+# Standalone producer
+node examples/producer.js
+
+# Standalone consumer (runs until Ctrl+C)
+node examples/consumer.js
 ```
-┌──────────────────────────────────────────┐
-│ Producer / Consumer / Admin (High-Level) │
-├──────────────────────────────────────────┤
-│ Session (Queue ops, ACK/Confirm flow)    │
-├──────────────────────────────────────────┤
-│ Protocol Codec (Binary encoding/parsing) │
-├──────────────────────────────────────────┤
-│ TCP Connection (Framing, heartbeat)      │
-└──────────────────────────────────────────┘
-           │ TCP Socket │
-           ▼            ▼
-┌──────────────────────────────────────────┐
-│         BlazingMQ Broker                 │
-└──────────────────────────────────────────┘
-```
 
-**Inspired by** the [BlazingMQ Python SDK](https://github.com/bloomberg/blazingmq-sdk-python) architecture and the [BlazingMQ Java SDK](https://github.com/bloomberg/blazingmq-sdk-java) protocol implementation.
+---
 
 ## Running Tests
 
 ```bash
 # Unit tests (no broker required)
-npm test -- --testPathPattern=protocol
+npm run test:unit
 
-# Integration tests (requires running broker at localhost:30114)
-npm test -- --testPathPattern=integration
+# Integration tests (requires broker on localhost:30114)
+npm run test:integration
 
 # All tests
 npm test
+
+# With coverage report
+npm run test:coverage
 ```
 
-## Running Examples
+---
 
-```bash
-# Build the SDK first
-npm run build
-
-# Run the end-to-end demo
-node examples/run-e2e.js
-```
-
-## Running BlazingMQ Broker (Docker)
+## Running the Broker
 
 ```bash
 # From the blazingmq repository root:
 docker compose -f docker/single-node/docker-compose.yaml up -d
 ```
 
-Make sure port 30114 is exposed in the docker-compose.yaml:
+Ensure port 30114 is exposed:
 ```yaml
 services:
   bmqbrkr:
@@ -349,11 +456,40 @@ services:
       - "30114:30114"
 ```
 
-## Requirements
+---
 
-- **Node.js** ≥ 18.0.0
-- **BlazingMQ Broker** running and accessible via TCP
+## Project Structure
+
+```
+src/
+├── protocol/
+│   ├── constants.ts     # Enums, sizes, magic numbers
+│   ├── codec.ts         # Binary encoder/decoder (stateless pure functions)
+│   └── index.ts
+├── transport/
+│   ├── connection.ts    # TCP connection + event framing state machine
+│   └── index.ts
+├── session.ts           # Core protocol state machine
+├── producer.ts          # High-level Producer API
+├── consumer.ts          # High-level Consumer API
+├── admin.ts             # High-level Admin API
+├── errors.ts            # Error class hierarchy
+├── types.ts             # TypeScript interfaces
+└── index.ts             # Public API barrel export
+
+docs/
+├── architecture.md      # Layered architecture overview
+├── protocol.md          # Wire protocol specification
+├── transport.md         # Transport layer documentation
+└── session.md           # Session layer documentation
+```
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0
+[Apache-2.0](./LICENSE)

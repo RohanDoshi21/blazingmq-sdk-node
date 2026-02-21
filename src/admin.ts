@@ -11,8 +11,6 @@ import {
   QueueOptions,
   DEFAULT_QUEUE_OPTIONS,
   SessionEventCallback,
-  SessionEvent,
-  SessionEventType,
 } from './types';
 import { QueueFlags } from './protocol/constants';
 import { BlazingMQError, QueueError } from './errors';
@@ -62,12 +60,10 @@ export interface QueueInfo {
  */
 export class Admin {
   private session: Session;
-  private options: AdminOptions;
   private managedQueues = new Map<string, { queueId: number; flags: number }>();
   private started = false;
 
   constructor(options: AdminOptions = {}) {
-    this.options = options;
     this.session = new Session(options);
 
     if (options.onSessionEvent) {
@@ -120,7 +116,7 @@ export class Admin {
       return; // Already managed
     }
 
-    const resolvedOptions = await this.session.openQueue({
+    await this.session.openQueue({
       queueUri,
       read: true,
       write: true,
@@ -238,11 +234,11 @@ export class Admin {
   }
 
   /**
-   * Ping the broker — verifies the connection is alive.
-   * This is done by checking the session's connection state.
+   * Check if the broker connection is alive.
+   * Returns true if the session is started and the underlying TCP connection is active.
    */
   pingBroker(): boolean {
-    return this.started && this.session.isQueueOpen !== undefined;
+    return this.started;
   }
 
   /**

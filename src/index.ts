@@ -9,19 +9,22 @@
 export { Session } from './session';
 
 // High-level APIs
-import { Producer, ProducerOptions, PublishOptions } from './producer';
-import { Consumer, ConsumerOptions, SubscribeOptions } from './consumer';
-import { Admin, AdminOptions, QueueInfo } from './admin';
-export { Producer, ProducerOptions, PublishOptions };
-export { Consumer, ConsumerOptions, SubscribeOptions };
-export { Admin, AdminOptions, QueueInfo };
+export { Producer } from './producer';
+export type { ProducerOptions, PublishOptions } from './producer';
+export { Consumer } from './consumer';
+export type { ConsumerOptions, SubscribeOptions } from './consumer';
+export { Admin } from './admin';
+export type { AdminOptions, QueueInfo } from './admin';
 
 // Types
 export {
+  DEFAULT_QUEUE_OPTIONS,
+  SessionEventType,
+} from './types';
+export type {
   SessionOptions,
   TimeoutOptions,
   QueueOptions,
-  DEFAULT_QUEUE_OPTIONS,
   Message,
   MessageHandle,
   Ack,
@@ -29,12 +32,9 @@ export {
   MessageCallback,
   SessionEventCallback,
   SessionEvent,
-  SessionEventType,
   OpenQueueParams,
   PostOptions,
   PropertyEntry,
-  PropertyValueMap,
-  PropertyTypeMap,
 } from './types';
 
 // Protocol constants & enums
@@ -62,32 +62,3 @@ export {
 
 // Utility
 export { guidToHex, hexToGuid } from './protocol/codec';
-
-/**
- * Convenience function to create a producer with minimal configuration.
- */
-export function createProducer(
-  broker: string = 'tcp://localhost:30114',
-  defaultQueueUri?: string,
-) {
-  return new Producer({ broker, defaultQueueUri });
-}
-
-/**
- * Convenience function to create a consumer with minimal configuration.
- */
-export function createConsumer(
-  broker: string = 'tcp://localhost:30114',
-  onMessage?: (message: any, handle: any) => void,
-) {
-  return new Consumer({ broker, onMessage });
-}
-
-/**
- * Convenience function to create an admin client with minimal configuration.
- */
-export function createAdmin(
-  broker: string = 'tcp://localhost:30114',
-) {
-  return new Admin({ broker });
-}

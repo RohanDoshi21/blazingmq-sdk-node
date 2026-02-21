@@ -1,3 +1,7 @@
 dist/
 node_modules/
+coverage/
 .vscode/
+*.tgz
+*.log
+.DS_Store

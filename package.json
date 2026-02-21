@@ -1,15 +1,19 @@
 {
   "name": "blazingmq",
   "version": "1.0.0",
-  "description": "Production-ready Node.js SDK for BlazingMQ — a high-performance, open-source message queue system",
+  "description": "Pure-JavaScript Node.js SDK for BlazingMQ — Bloomberg's high-performance open-source message queue",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "clean": "rm -rf dist",
+    "rebuild": "npm run clean && npm run build",
     "test": "jest --runInBand",
+    "test:unit": "jest --runInBand --testPathPattern=protocol",
     "test:integration": "jest --runInBand --testPathPattern=integration",
-    "lint": "eslint src/ --ext .ts",
-    "prepublishOnly": "npm run build"
+    "test:coverage": "jest --runInBand --coverage",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run rebuild"
   },
   "keywords": [
     "blazingmq",
@@ -18,9 +22,19 @@
     "publish-subscribe",
     "messaging",
     "queue",
-    "broker"
+    "broker",
+    "bloomberg"
   ],
+  "author": "Rohan Doshi",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RohanDoshi21/blazingmq-sdk-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RohanDoshi21/blazingmq-sdk-node/issues"
+  },
+  "homepage": "https://github.com/RohanDoshi21/blazingmq-sdk-node#readme",
   "devDependencies": {
     "@types/jest": "^29.5.12",
     "@types/node": "^22.0.0",
@@ -34,6 +48,7 @@
   "files": [
     "dist/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ]
 }

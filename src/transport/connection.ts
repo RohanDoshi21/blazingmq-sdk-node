@@ -16,7 +16,7 @@ import {
   EVENT_HEADER_SIZE,
   MAX_EVENT_SIZE,
 } from '../protocol/constants';
-import { decodeEventHeader, EventHeader } from '../protocol/codec';
+import { decodeEventHeader } from '../protocol/codec';
 
 export interface ConnectionOptions {
   host: string;

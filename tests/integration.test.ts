@@ -14,7 +14,6 @@ import {
   AckResult,
   PropertyType,
   Message,
-  MessageHandle,
   Ack,
   SessionEvent,
 } from '../src';
