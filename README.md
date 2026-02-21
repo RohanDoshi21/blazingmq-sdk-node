@@ -1,13 +1,15 @@
-# BlazingMQ Node.js SDK
+# blazingmq-node
 
-An **unofficial pure-JavaScript** Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
+> **Disclaimer:** This is an **unofficial, community-maintained** SDK. It is not affiliated with, endorsed by, or supported by Bloomberg LP.
+
+A pure-JavaScript Node.js SDK for [BlazingMQ](https://github.com/bloomberg/blazingmq) —
 Bloomberg's high-performance, open-source message queue system.
 
 This SDK implements the BlazingMQ binary wire protocol natively over TCP. No C++ bindings,
 no native modules, no `node-gyp` — just TypeScript that speaks the protocol directly.
 
 ```
-npm install blazingmq
+npm install blazingmq-node
 ```
 
 ## Table of Contents
@@ -39,7 +41,7 @@ npm install blazingmq
 ### Producing Messages
 
 ```typescript
-import { Producer, AckResult } from 'blazingmq';
+import { Producer, AckResult } from 'blazingmq-node';
 
 const producer = new Producer({ broker: 'tcp://localhost:30114' });
 await producer.start();
@@ -62,7 +64,7 @@ await producer.stop();
 ### Consuming Messages
 
 ```typescript
-import { Consumer, PropertyType } from 'blazingmq';
+import { Consumer, PropertyType } from 'blazingmq-node';
 
 const consumer = new Consumer({
   broker: 'tcp://localhost:30114',
@@ -87,6 +89,8 @@ await consumer.subscribe({
 ### Async Iterator Pattern
 
 ```typescript
+import { Consumer } from 'blazingmq-node';
+
 const consumer = new Consumer({ broker: 'tcp://localhost:30114' });
 await consumer.start();
 await consumer.subscribe({ queueUri: 'bmq://bmq.test.mem.priority/my-queue' });
@@ -327,6 +331,8 @@ const admin = new Admin(options?: AdminOptions);
 The `Session` class provides direct protocol access:
 
 ```typescript
+import { Session } from 'blazingmq-node';
+
 const session = new Session({ broker: 'tcp://localhost:30114' });
 session.setMessageCallback((msg, handle) => handle.confirm());
 await session.start();
